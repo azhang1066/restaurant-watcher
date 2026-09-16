@@ -1,0 +1,46 @@
+"""Thin wrapper around Places API (New). Field masks are kept minimal on
+purpose -- businessStatus/displayName/formattedAddress stay in the cheap
+Essentials/Pro tier, so a weekly check of a few hundred places costs cents.
+Avoid adding rating/hours/photos/phone fields here; those bump every call
+to the Enterprise SKU.
+"""
+import os
+import requests
+
+PLACES_BASE = "https://places.googleapis.com/v1"
+
+
+def _api_key():
+    key = os.environ.get("GOOGLE_PLACES_API_KEY")
+    if not key:
+        raise RuntimeError("Set GOOGLE_PLACES_API_KEY in your environment / .env")
+    return key
+
+
+def find_place_id(name, address_hint=""):
+    """Resolve a restaurant name (+ optional address/neighborhood) to a place_id
+    via Text Search. Used once, at seed time, per restaurant."""
+    url = f"{PLACES_BASE}/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": _api_key(),
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.googleMapsUri",
+    }
+    query = f"{name} {address_hint}".strip()
+    resp = requests.post(url, headers=headers, json={"textQuery": query}, timeout=15)
+    resp.raise_for_status()
+    places = resp.json().get("places", [])
+    return places[0] if places else None
+
+
+def get_business_status(place_id):
+    """Cheap status check: id + businessStatus + displayName only."""
+    url = f"{PLACES_BASE}/places/{place_id}"
+    headers = {
+        "X-Goog-Api-Key": _api_key(),
+        "X-Goog-FieldMask": "id,businessStatus,displayName",
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("businessStatus", "OPERATIONAL")
