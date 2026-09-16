@@ -6,8 +6,19 @@ to the Enterprise SKU.
 """
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 PLACES_BASE = "https://places.googleapis.com/v1"
+
+_session = requests.Session()
+_retry = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("GET", "POST"),
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
 def _api_key():
@@ -27,7 +38,7 @@ def find_place_id(name, address_hint=""):
         "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.googleMapsUri",
     }
     query = f"{name} {address_hint}".strip()
-    resp = requests.post(url, headers=headers, json={"textQuery": query}, timeout=15)
+    resp = _session.post(url, headers=headers, json={"textQuery": query}, timeout=15)
     resp.raise_for_status()
     places = resp.json().get("places", [])
     return places[0] if places else None
@@ -40,7 +51,7 @@ def get_business_status(place_id):
         "X-Goog-Api-Key": _api_key(),
         "X-Goog-FieldMask": "id,businessStatus,displayName",
     }
-    resp = requests.get(url, headers=headers, timeout=15)
+    resp = _session.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     return data.get("businessStatus", "OPERATIONAL")

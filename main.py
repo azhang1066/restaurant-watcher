@@ -9,6 +9,7 @@ Run once manually:  python main.py --once
 Run on a schedule:   python main.py           (blocks, checks weekly)
 """
 import argparse
+import logging
 import os
 from datetime import datetime
 
@@ -21,6 +22,9 @@ from closure_checker import check_closing_soon
 from notifier import notify_closed, notify_closing_soon
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 CLOSING_SOON_CHECK_EVERY = int(os.environ.get("CLOSING_SOON_CHECK_EVERY", 4))  # every 4th run
 _run_count_file = os.path.join(os.path.dirname(__file__), "data", ".run_count")
@@ -44,29 +48,34 @@ def run_check(include_news_check=None):
         include_news_check = (run_count % CLOSING_SOON_CHECK_EVERY == 0)
 
     restaurants = list_restaurants(active_only=True)
-    print(f"[{datetime.now().isoformat()}] Checking {len(restaurants)} restaurants "
-          f"(news check: {'on' if include_news_check else 'off'})")
+    logger.info("Checking %d restaurants (news check: %s)",
+                len(restaurants), "on" if include_news_check else "off")
 
+    failures = 0
     for r in restaurants:
-        status = get_business_status(r["place_id"])
+        try:
+            status = get_business_status(r["place_id"])
 
-        closing_soon, summary = False, r.get("closing_soon_summary") or ""
-        if include_news_check and status == "OPERATIONAL":
-            result = check_closing_soon(r["name"], r.get("address"))
-            closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
-            summary = result["summary"]
+            closing_soon, summary = False, r.get("closing_soon_summary") or ""
+            if include_news_check and status == "OPERATIONAL":
+                result = check_closing_soon(r["name"], r.get("address"))
+                closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
+                summary = result["summary"]
 
-        update_check_result(r["id"], status, closing_soon, summary)
+            update_check_result(r["id"], status, closing_soon, summary)
 
-        was_operational = r["business_status"] == "OPERATIONAL"
-        if status in ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY") and was_operational:
-            notify_closed(r, status)
-            if status == "CLOSED_PERMANENTLY":
-                archive_restaurant(r["id"])
-        elif closing_soon and not r["closing_soon_flag"]:
-            notify_closing_soon(r, summary)
+            was_operational = r["business_status"] == "OPERATIONAL"
+            if status in ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY") and was_operational:
+                notify_closed(r, status)
+                if status == "CLOSED_PERMANENTLY":
+                    archive_restaurant(r["id"])
+            elif closing_soon and not r["closing_soon_flag"]:
+                notify_closing_soon(r, summary)
+        except Exception:
+            failures += 1
+            logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
 
-    print("Done.")
+    logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
 
 
 if __name__ == "__main__":
@@ -79,5 +88,5 @@ if __name__ == "__main__":
     else:
         scheduler = BlockingScheduler()
         scheduler.add_job(run_check, "interval", weeks=1, next_run_time=datetime.now())
-        print("Scheduler started -- checking weekly. Ctrl+C to stop.")
+        logger.info("Scheduler started -- checking weekly. Ctrl+C to stop.")
         scheduler.start()

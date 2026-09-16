@@ -3,16 +3,27 @@ uses, so this can share a topic/setup if you want one phone feed for both.
 """
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "restaurant-watcher-changeme")
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
+
+_session = requests.Session()
+_retry = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("POST",),
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
 def notify(title, message, priority="default", url=None):
     headers = {"Title": title, "Priority": priority}
     if url:
         headers["Click"] = url
-    requests.post(NTFY_URL, data=message.encode("utf-8"), headers=headers, timeout=10)
+    _session.post(NTFY_URL, data=message.encode("utf-8"), headers=headers, timeout=10)
 
 
 def notify_closed(restaurant, status):
