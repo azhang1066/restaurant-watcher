@@ -87,18 +87,8 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
 - No dedup/backoff beyond the state-transition check in `main.py`; no notification log.
 
 ### Gaps / risks worth knowing about
-- ~~No retry/backoff on any HTTP call.~~ **Fixed for `places_client.py` and
-  `notifier.py`** — both now use a `requests.Session` with a `urllib3` `Retry` adapter
-  (3 retries, exponential backoff, retries on 429/500/502/503/504). `closure_checker.py`
-  goes through the `anthropic` SDK rather than raw `requests`, so it wasn't touched here
   — the SDK has its own retry defaults, worth confirming separately if this keeps failing.
-- ~~No automated tests.~~ **Fixed** — `tests/test_db.py` (state transitions: add/dedupe,
-  update_check_result + check_log, archive) and `tests/test_closure_checker.py` (JSON
-  extraction: clean JSON, JSON wrapped in prose, no braces, malformed JSON, missing
-  fields) added, 9 tests, run via `pytest` from repo root. `pytest` added to
-  `requirements.txt`; root `conftest.py` added so `tests/` can import the top-level
-  modules.
-- `flask` dependency is unused — either build the dashboard it implies (Phase 3) or drop it.
+- `flask` dependency is unused — either build the dashboard it implies (Phase 2) or drop it.
 
 ## 3. Phased Work Plan
 

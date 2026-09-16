@@ -23,6 +23,11 @@ You'll need:
 - **Anthropic API key** (for the closing-soon news check)
 - **ntfy topic** -- pick any unique string, then subscribe to it in the
   [ntfy app](https://ntfy.sh/) on your phone
+- **SMTP credentials** (optional) -- set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`,
+  `EMAIL_FROM`, and `EMAIL_TO` in `.env` to also get alerts by email. Leave these
+  unset and only ntfy push notifications will fire. For Gmail, use an
+  [app password](https://myaccount.google.com/apppasswords) rather than your
+  normal password.
 
 ## Seed your list
 
