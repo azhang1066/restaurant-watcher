@@ -60,7 +60,11 @@ def run_check(include_news_check=None):
         try:
             status = get_business_status(r["place_id"])
 
-            closing_soon, summary = False, r.get("closing_soon_summary") or ""
+            # Carry the stored flag forward: only a news check can change it,
+            # so defaulting to False here would clear it on every plain run and
+            # let the next news check re-alert about a closure already sent.
+            closing_soon = bool(r["closing_soon_flag"])
+            summary = r.get("closing_soon_summary") or ""
             if include_news_check and status == "OPERATIONAL":
                 result = check_closing_soon(r["name"], r.get("address"))
                 closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
@@ -68,13 +72,19 @@ def run_check(include_news_check=None):
 
             update_check_result(r["id"], status, closing_soon, summary)
 
-            was_operational = r["business_status"] == "OPERATIONAL"
-            if status in ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY") and was_operational:
+            # Notify on any move *into* a closed status, not just from
+            # OPERATIONAL -- temporarily-closed places close for good too.
+            status_changed = status != r["business_status"]
+            if status in ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY") and status_changed:
                 notify_closed(r, status)
-                if status == "CLOSED_PERMANENTLY":
-                    archive_restaurant(r["id"])
             elif closing_soon and not r["closing_soon_flag"]:
                 notify_closing_soon(r, summary)
+
+            # Archive on the status itself rather than on the transition, so a
+            # place that reached CLOSED_PERMANENTLY by some path that skipped
+            # the notify above still leaves the active list. Idempotent.
+            if status == "CLOSED_PERMANENTLY":
+                archive_restaurant(r["id"])
         except Exception:
             failures += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])

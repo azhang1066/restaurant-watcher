@@ -1,9 +1,11 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-17, against 4 commits through `f7e66b6` ("Adding log pruning")
-plus uncommitted work — 7 modules + 3 test files, ~960 lines. This plan tracks open work
-only; finished items (HTTP retries, the test suite, email notifications, log pruning,
-call-time config) are dropped once done — see git history for what landed._
+_Last reviewed: 2026-09-17, against 5 commits through `c4f033d` ("Fixed environment
+variables pulling from different places") plus uncommitted work (`tests/test_main.py`
+and the two notification fixes it prompted) — 7 modules + 4 test files, ~1400 lines.
+This plan tracks open work only; finished items (HTTP retries, the test suite, email
+notifications, log pruning, call-time config, `run_check` coverage, the notify-on-
+transition fixes) are dropped once done — see git history for what landed._
 
 ## 1. Technical Overview
 
@@ -69,6 +71,17 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
    future `list_restaurants(active_only=True)` calls). Temporary closures and
    closing-soon flags stay active so they keep surfacing on later runs.
 
+### Test coverage
+`tests/` covers `db` (state transitions, pruning, rollups), `closure_checker` (JSON
+extraction from messy model output), `notifier` (call-time config, email fallbacks,
+failure isolation) and, as of 2026-09-17, `main.run_check` — news-check cadence,
+notify-on-transition, the closing-soon flag, per-restaurant failure isolation and
+housekeeping. `test_main.py` fakes the three external calls and runs against a real
+temp SQLite file, so the transitions it asserts are the same reads and writes
+production does — it caught two live notification bugs on the way in (both since
+fixed). 42 tests, all passing. `seed.py` and `places_client.py` remain uncovered
+(both are thin HTTP wrappers).
+
 ### External API integrations
 - **Google Places API (New)** — the only restaurant-status source today. Two calls:
   - `places:searchText` (seed time only) — resolves name/address to a `place_id`.
@@ -94,11 +107,18 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
     `EMAIL_FROM` (or `SMTP_USER`) and `EMAIL_TO` are all set; `_email_settings()`
     returns `None` otherwise and the send is skipped. Failures are caught and logged,
     so a broken mail server never breaks the ntfy alert or the run.
-- Two notification types: `notify_closed` (high priority, fires on any transition into
-  `CLOSED_TEMPORARILY`/`CLOSED_PERMANENTLY`) and `notify_closing_soon` (default
-  priority, fires once when the flag flips from unset to set — it does not re-fire on
-  subsequent runs since `closing_soon_flag` stays `1`).
-- No dedup/backoff beyond the state-transition check in `main.py`; no notification log.
+- Two notification types:
+  - `notify_closed` (high priority) — fires on any change *into*
+    `CLOSED_TEMPORARILY`/`CLOSED_PERMANENTLY`, including temporary → permanent, which
+    is a distinct event worth hearing about.
+  - `notify_closing_soon` (default priority) — fires when `closing_soon_flag` goes
+    0 → 1. Only a news check can move that flag; plain runs carry the stored value
+    forward, so the alert is sent once per closure story rather than once per news
+    cycle. A later news check finding no signal clears the flag and re-arms the alert.
+- Archiving keys off the status (`CLOSED_PERMANENTLY`), not the transition, so a row
+  stranded active by a failed run still leaves the active list on the next one.
+- No dedup/backoff beyond these state-transition checks in `main.py`; no notification
+  log. `tests/test_main.py` is what pins all of this down.
 
 ### Gaps / risks worth knowing about
 - **`closure_checker.py` has no retry story of its own.** `places_client.py` and
@@ -106,9 +126,11 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
   on 429/500/502/503/504), but `closure_checker.py` goes through the `anthropic` SDK
   rather than raw `requests` and just inherits whatever the SDK's defaults are — worth
   confirming if news checks start failing.
-- **Nothing tests `main.run_check`** — the orchestration, the transition-to-notify logic
-  and the per-restaurant failure isolation are all uncovered; tests stop at `db`,
-  `closure_checker` and `notifier`.
+- **`main.py` still reads config at import time.** `CLOSING_SOON_CHECK_EVERY` and
+  `CHECK_LOG_RETAIN_DAYS` are module-level constants, the exact pattern that `notifier.py`
+  and `places_client.py` were moved away from in `c4f033d` (their tests explain why).
+  It works today only because `load_dotenv()` runs above them in the same file; tests
+  have to patch the attribute rather than the env var.
 - `flask` dependency is unused — either build the dashboard it implies (Phase 2) or drop it.
 
 ## 3. Phased Work Plan
@@ -143,8 +165,8 @@ is a sibling concern:
   news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) —
+1. Commit the pending work (`tests/test_main.py` + the two `main.py` notification
+   fixes) — the tree has been clean at every other checkpoint.
+2. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) —
    this is the biggest unknown and worth a short spike before committing to a design.
-2. Decide `flask`'s fate: build Phase 2's minimal dashboard, or drop the dependency.
-3. Add a `run_check` test covering notify-on-transition and per-restaurant failure
-   isolation — the last uncovered logic in the repo.
+3. Decide `flask`'s fate: build Phase 2's minimal dashboard, or drop the dependency.
