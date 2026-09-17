@@ -55,9 +55,15 @@ def _post_unarchive(client, restaurant_id, token=None, follow_redirects=False, *
                        follow_redirects=follow_redirects)
 
 
-def _add(name, place_id, **checks):
-    """Seed one restaurant, optionally running a check result through it."""
-    db.add_restaurant(name, place_id, address=f"{name} address")
+def _add(name, place_id, verified=True, **checks):
+    """Seed one restaurant, optionally running a check result through it.
+
+    Verified by default: an unverified row is one main.run_check refuses to
+    check, and it renders with its own badge and a confirm prompt, so leaving
+    every fixture unverified would put that state under tests about something
+    else entirely. The verification tests pass verified=False.
+    """
+    db.add_restaurant(name, place_id, address=f"{name} address", verified=verified)
     restaurant_id = next(r["id"] for r in db.list_restaurants(active_only=False)
                          if r["place_id"] == place_id)
     if checks:
@@ -638,3 +644,186 @@ def test_closing_soon_stat_matches_the_badges_on_screen(client):
     assert 'badge warn">Closing soon' not in body
     # The summary itself still shows -- it is the context for the closure.
     assert "Announced final service" in body
+
+
+# --- verifying a restaurant ---------------------------------------------
+
+def _post_verify(client, restaurant_id, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post(f"/restaurant/{restaurant_id}/verify", data=data,
+                       follow_redirects=follow_redirects)
+
+
+def _post_reject(client, restaurant_id, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post(f"/restaurant/{restaurant_id}/reject", data=data,
+                       follow_redirects=follow_redirects)
+
+
+def test_unverified_restaurant_is_listed_for_verification(client):
+    _add("Lilia", "place-lilia", verified=False)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "waiting to be verified" in body
+    assert "Needs verifying" in body
+    assert "Yes, that's the place" in body
+
+
+def test_verified_restaurant_is_not_listed_for_verification(client):
+    _add("Lilia", "place-lilia")
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "waiting to be verified" not in body
+    assert "Needs verifying" not in body
+
+
+def test_never_checked_restaurant_is_not_reported_as_open(client):
+    """business_status defaults to OPERATIONAL in the schema, so a row nobody
+    has looked up would otherwise wear an "Open" badge on a default -- and
+    wear it forever now, since an unverified row is never checked."""
+    _add("Lilia", "place-lilia", verified=False)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert ">Open<" not in body
+
+
+def test_verify_marks_the_row_and_nothing_else(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    before = db.get_restaurant(restaurant_id)
+
+    _post_verify(client, restaurant_id)
+
+    after = db.get_restaurant(restaurant_id)
+    assert after["verified_at"] is not None
+    assert {k: v for k, v in after.items() if k != "verified_at"} == \
+           {k: v for k, v in before.items() if k != "verified_at"}
+
+
+def test_verify_requires_a_csrf_token(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = _post_verify(client, restaurant_id, token="wrong")
+
+    assert response.status_code == 400
+    assert db.get_restaurant(restaurant_id)["verified_at"] is None
+
+
+def test_verify_is_unreachable_by_get(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = client.get(f"/restaurant/{restaurant_id}/verify")
+
+    assert response.status_code == 405
+    assert db.get_restaurant(restaurant_id)["verified_at"] is None
+
+
+def test_verify_reports_a_repeat_rather_than_a_change(client):
+    """Double-submitted form: the timestamp must not move, and the page must
+    not claim something just happened."""
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    _post_verify(client, restaurant_id)
+    first = db.get_restaurant(restaurant_id)["verified_at"]
+
+    body = _post_verify(client, restaurant_id,
+                        follow_redirects=True).get_data(as_text=True)
+
+    assert db.get_restaurant(restaurant_id)["verified_at"] == first
+    assert "was already verified" in body
+
+
+def test_verify_404s_for_an_unknown_restaurant(client):
+    assert _post_verify(client, 999).status_code == 404
+
+
+def test_reject_deletes_the_restaurant_and_its_history(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    db.update_check_result(restaurant_id, "OPERATIONAL", False, "")
+
+    _post_reject(client, restaurant_id)
+
+    assert db.get_restaurant(restaurant_id) is None
+    assert db.check_history(restaurant_id) == []
+
+
+def test_reject_reopens_the_search_with_the_name_filled_in(client):
+    """The address isn't carried over on purpose -- it belongs to the wrong
+    place, so re-searching with it would just find that place again."""
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = _post_reject(client, restaurant_id)
+    assert response.headers["Location"].endswith("/?q=Lilia")
+
+    body = client.get(response.headers["Location"]).get_data(as_text=True)
+    assert 'value="Lilia"' in body
+    assert "Lilia address" not in body
+
+
+def test_reject_requires_a_csrf_token(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = _post_reject(client, restaurant_id, token="wrong")
+
+    assert response.status_code == 400
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_reject_is_unreachable_by_get(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    assert client.get(f"/restaurant/{restaurant_id}/reject").status_code == 405
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_reject_refuses_to_delete_a_verified_restaurant(client):
+    """This is the only route that destroys data, so it's scoped to rows
+    nobody has vouched for yet: a stale tab must not be able to throw away a
+    restaurant confirmed long ago, history and all."""
+    restaurant_id = _add("Lilia", "place-lilia")
+
+    response = _post_reject(client, restaurant_id)
+
+    assert response.status_code == 400
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_dashboard_adds_are_stored_already_verified(client):
+    """The confirm page is the verification. Asking again at first check
+    would be the same question about the same two facts -- and would leave a
+    just-added restaurant unchecked until it was answered twice."""
+    token = _csrf(client)
+    with client.session_transaction() as sess:
+        sess["pending_add"] = {"name": "Lilia", "place_id": "place-lilia",
+                               "address": "567 Union Ave", "maps_url": "",
+                               "query": "lilia"}
+
+    client.post("/add/confirm", data={"csrf_token": token, "place_id": "place-lilia"})
+
+    assert db.get_restaurant_by_place_id("place-lilia")["verified_at"] is not None
+
+
+def test_verify_button_round_trips_a_token_from_the_rendered_page(client):
+    """The other verification tests seed the session, so nothing else would
+    notice the form and the check disagreeing about the field name."""
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    body = client.get("/").get_data(as_text=True)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+
+    client.post(f"/restaurant/{restaurant_id}/verify", data={"csrf_token": token})
+
+    assert db.get_restaurant(restaurant_id)["verified_at"] is not None
+
+
+def test_unverified_count_matches_the_rows_on_the_page(client):
+    """Same guard as the closing-soon count: the summary tile and the list
+    are computed from one pass, and this is what stops them drifting."""
+    _add("Lilia", "place-lilia", verified=False)
+    _add("Don Angie", "place-don-angie", verified=False)
+    _add("Katz's", "place-katz")
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "<b>2</b><span>To verify</span>" in body
+    assert body.count("Needs verifying") == 2

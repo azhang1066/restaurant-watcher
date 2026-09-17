@@ -7,6 +7,8 @@ file by hand. This serves:
     /restaurant/<id>             one restaurant, plus its per-month history
     /restaurant/<id>/unarchive   POST: put an archived restaurant back (see
                                  db.unarchive_restaurant for the caveat)
+    /restaurant/<id>/verify      POST: confirm this is the right place
+    /restaurant/<id>/reject      POST: it wasn't -- delete it and search again
     /add                         POST: search Google Places for a name
     /add/confirm                 GET: show the match, POST: track it
 
@@ -22,6 +24,15 @@ exactly like tracking the right one. Hence the two steps: the search stashes
 its candidate and redirects, and a second, separate POST is what writes the
 row. The redirect in between also means a reload of the confirm page re-reads
 the stash rather than re-running (and re-paying for) the search.
+
+Verifying is the same question the confirm page asks, asked late instead of
+early: seed.py resolves a whole file of names to place_ids with nobody
+looking at any of them, and main.run_check refuses to check a restaurant
+until someone has said yes. Rows added *through* the confirm page are stored
+already verified -- that page is the yes -- so this only ever asks about
+places nobody has actually looked at. Saying no deletes the row outright
+rather than archiving it, because its history describes a different
+restaurant; the search box is re-opened with the name filled in.
 
 Because there is now a state-changing route, every form carries a CSRF token
 tied to the session -- see `_csrf_token()`. That needs a signing key, so set
@@ -48,9 +59,9 @@ from dotenv import load_dotenv
 from flask import (Flask, abort, flash, redirect, render_template, request,
                    session, url_for)
 
-from db import (add_restaurant, check_history, get_restaurant,
-                get_restaurant_by_place_id, init_db, list_restaurants,
-                unarchive_restaurant)
+from db import (add_restaurant, check_history, delete_restaurant,
+                get_restaurant, get_restaurant_by_place_id, init_db,
+                list_restaurants, unarchive_restaurant, verify_restaurant)
 from places_client import find_place_id, place_summary
 
 load_dotenv()
@@ -160,6 +171,11 @@ def _view(restaurant, now):
     status = restaurant["business_status"] or "OPERATIONAL"
     checked_at = _parse_ts(restaurant.get("last_checked_at"))
     closing_soon = bool(restaurant["closing_soon_flag"])
+    archived = bool(restaurant["archived"])
+    # Exactly the rows main.run_check() skips, so what the page calls "needs
+    # verifying" and what actually goes unchecked can't drift apart: that
+    # loop only ever looks at unarchived rows.
+    needs_verification = not restaurant.get("verified_at") and not archived
     return {
         "id": restaurant["id"],
         "name": restaurant["name"],
@@ -176,14 +192,22 @@ def _view(restaurant, now):
         # -- it keeps the page honest about a row written by anything else.
         "closing_soon_current": closing_soon and status != "CLOSED_PERMANENTLY",
         "closing_soon_summary": restaurant.get("closing_soon_summary") or "",
-        "archived": bool(restaurant["archived"]),
+        "archived": archived,
+        "verified": bool(restaurant.get("verified_at")),
+        "needs_verification": needs_verification,
+        # The schema defaults business_status to OPERATIONAL, so an unchecked
+        # row would otherwise render as a confident "Open" for a place nobody
+        # has ever looked up -- and now indefinitely, since an unverified one
+        # is never checked at all.
+        "status_known": checked_at is not None,
         "checked_at": checked_at,
         "checked_age": _age(checked_at, now),
         # Never checked is its own state, not a stale one -- a freshly seeded
         # restaurant hasn't missed anything yet.
         "stale": (checked_at is not None
                   and (now - checked_at).days >= STALE_AFTER_DAYS),
-        "needs_attention": closing_soon or status in _ATTENTION_STATUSES,
+        "needs_attention": (closing_soon or status in _ATTENTION_STATUSES
+                            or needs_verification),
     }
 
 
@@ -209,16 +233,22 @@ def create_app():
         views = sorted((_view(r, now) for r in list_restaurants(active_only=False)),
                        key=_sort_key)
         active = [v for v in views if not v["archived"]]
+        pending = [v for v in views if v["needs_verification"]]
         summary = {
             "active": len(active),
             "closed": sum(1 for v in active if v["status"] in _ATTENTION_STATUSES),
             "closing_soon": sum(1 for v in active if v["closing_soon_current"]),
             "archived": sum(1 for v in views if v["archived"]),
             "stale": sum(1 for v in active if v["stale"]),
+            "unverified": len(pending),
         }
         return render_template("index.html", restaurants=views, summary=summary,
+                               pending=pending,
                                stale_after_days=STALE_AFTER_DAYS,
-                               max_query_chars=MAX_QUERY_CHARS)
+                               max_query_chars=MAX_QUERY_CHARS,
+                               # Set when a rejected match bounced back here,
+                               # so the box is ready for a narrower query.
+                               prefill=(request.args.get("q") or "")[:MAX_QUERY_CHARS])
 
     def _back_to(restaurant_id):
         """Send a POST back to the page it came from.
@@ -272,6 +302,53 @@ def create_app():
         else:
             flash(message, "info")
         return _back_to(restaurant_id)
+
+    # --- verifying a restaurant ------------------------------------------
+
+    @app.post("/restaurant/<int:restaurant_id>/verify")
+    def verify(restaurant_id):
+        """Yes, that's the place. From here on run_check will check it."""
+        _require_csrf()
+        restaurant = get_restaurant(restaurant_id)
+        if restaurant is None:
+            abort(404)
+
+        if not verify_restaurant(restaurant_id):
+            # Already verified: a double submit, or a page left open past
+            # someone else confirming it. Nothing changed, so don't claim it.
+            flash(f"{restaurant['name']} was already verified.", "info")
+            return _back_to(restaurant_id)
+
+        logger.info("Verified %s (id=%s, place_id=%s)",
+                    restaurant["name"], restaurant_id, restaurant["place_id"])
+        flash(f"Verified {restaurant['name']} \u2014 the next check will "
+              "include it.", "info")
+        return _back_to(restaurant_id)
+
+    @app.post("/restaurant/<int:restaurant_id>/reject")
+    def reject(restaurant_id):
+        """No, wrong place. Delete the row and re-open the search.
+
+        The only route here that destroys anything, so it's deliberately
+        narrow: an already-verified restaurant can't be deleted through it.
+        That stops a stale tab throwing away a year of history for a place
+        confirmed long ago -- archiving is the tool for one that closed.
+        """
+        _require_csrf()
+        restaurant = get_restaurant(restaurant_id)
+        if restaurant is None:
+            abort(404)
+        if restaurant["verified_at"]:
+            abort(400, "That restaurant is already verified -- archive it instead.")
+
+        delete_restaurant(restaurant_id)
+        logger.info("Rejected %s (id=%s, place_id=%s) as the wrong place -- deleted",
+                    restaurant["name"], restaurant_id, restaurant["place_id"])
+        flash(f"Removed {restaurant['name']}. Search again with a street or city "
+              "\\u2014 that's what narrows it down.", "info")
+        # The stored address belongs to the wrong place, so only the name is
+        # carried over; re-using the address would just find it again.
+        return redirect(url_for("index", q=restaurant["name"][:MAX_QUERY_CHARS]))
 
     # --- adding a restaurant ---------------------------------------------
 
@@ -368,8 +445,12 @@ def create_app():
         if posted_place_id != candidate["place_id"]:
             abort(400, "That confirmation doesn't match the search it came from.")
 
+        # Verified on the way in: this POST *is* the user agreeing to the
+        # match the confirm page showed, so asking again at first check would
+        # be the same question about the same two facts.
         add_restaurant(name=candidate["name"], place_id=candidate["place_id"],
-                       address=candidate["address"], maps_url=candidate["maps_url"])
+                       address=candidate["address"], maps_url=candidate["maps_url"],
+                       verified=True)
         session.pop("pending_add", None)
 
         added = get_restaurant_by_place_id(candidate["place_id"])

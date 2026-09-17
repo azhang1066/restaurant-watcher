@@ -7,6 +7,14 @@
 - Housekeeping: after each run, aged-out check_log detail rows are folded
   into monthly rollups (CHECK_LOG_RETAIN_DAYS, 0 to disable).
 
+A restaurant is not checked at all until the user has confirmed it points at
+the right place. Text Search resolves a name to exactly one place_id with no
+confidence beside it, and seed.py resolves a whole file of them with nobody
+watching -- so the wrong "Lilia" is indistinguishable from the right one
+until somebody looks. Unverified rows are skipped here (no Places call, no
+Claude call, no alerts) and a single push per run says how many are waiting.
+The dashboard is where they get confirmed or thrown out.
+
 Run once manually:  python main.py --once
 Run on a schedule:   python main.py           (blocks, checks weekly)
 """
@@ -22,7 +30,7 @@ from db import (init_db, list_restaurants, update_check_result, archive_restaura
                 prune_check_log)
 from places_client import get_business_status
 from closure_checker import check_closing_soon
-from notifier import notify_closed, notify_closing_soon
+from notifier import notify_closed, notify_closing_soon, notify_needs_verification
 
 load_dotenv()
 
@@ -64,9 +72,15 @@ def run_check(include_news_check=None):
     if include_news_check is None:
         include_news_check = (run_count % _closing_soon_check_every() == 0)
 
-    restaurants = list_restaurants(active_only=True)
-    logger.info("Checking %d restaurants (news check: %s)",
-                len(restaurants), "on" if include_news_check else "off")
+    # Split rather than filtering in SQL: both halves are wanted, and one
+    # read keeps the count that gets notified about consistent with the list
+    # that got skipped.
+    active = list_restaurants(active_only=True)
+    unverified = [r for r in active if not r["verified_at"]]
+    restaurants = [r for r in active if r["verified_at"]]
+    logger.info("Checking %d restaurants (news check: %s%s)",
+                len(restaurants), "on" if include_news_check else "off",
+                f", {len(unverified)} unverified and skipped" if unverified else "")
 
     failures = news_failures = 0
     for r in restaurants:
@@ -124,6 +138,15 @@ def run_check(include_news_check=None):
             failures += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
 
+    if unverified:
+        # One push for the whole batch, after the checks so a run with real
+        # news leads with it. Isolated like the housekeeping below: a dead
+        # ntfy must not lose the check results already written.
+        try:
+            notify_needs_verification(unverified)
+        except Exception:
+            logger.exception("Couldn't send the needs-verifying notification -- continuing")
+
     retain_days = _check_log_retain_days()
     if retain_days > 0:
         try:
@@ -136,6 +159,10 @@ def run_check(include_news_check=None):
             logger.exception("check_log pruning failed -- continuing")
 
     logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
+    if unverified:
+        logger.warning("%d restaurant(s) skipped pending verification: %s. Confirm them "
+                       "on the dashboard to start checking them.",
+                       len(unverified), ", ".join(r["name"] for r in unverified))
     if news_failures:
         logger.warning("%d news check(s) failed; those restaurants kept their stored "
                        "closing-soon flag.", news_failures)

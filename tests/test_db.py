@@ -236,3 +236,88 @@ def test_check_history_merges_rollups_and_live_rows(tmp_path, monkeypatch):
     assert history[0]["operational_checks"] == 4
     assert history[1]["checks"] == 1
     assert history[1]["closed_checks"] == 1
+
+
+# --- verification -------------------------------------------------------
+
+def test_restaurants_start_unverified(tmp_path, monkeypatch):
+    restaurant_id = _seeded_restaurant(tmp_path, monkeypatch)
+
+    assert db.get_restaurant(restaurant_id)["verified_at"] is None
+
+
+def test_add_restaurant_can_store_one_already_verified(tmp_path, monkeypatch):
+    """What the dashboard's confirm step does -- the user already agreed to
+    the match, so there's nothing left to ask."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia", verified=True)
+
+    assert db.get_restaurant_by_place_id("place-lilia")["verified_at"] is not None
+
+
+def test_verify_restaurant_is_recorded_once(tmp_path, monkeypatch):
+    restaurant_id = _seeded_restaurant(tmp_path, monkeypatch)
+
+    assert db.verify_restaurant(restaurant_id) is True
+    stamped = db.get_restaurant(restaurant_id)["verified_at"]
+
+    assert db.verify_restaurant(restaurant_id) is False
+    assert db.get_restaurant(restaurant_id)["verified_at"] == stamped
+
+
+def test_verify_restaurant_reports_a_missing_row(tmp_path, monkeypatch):
+    _seeded_restaurant(tmp_path, monkeypatch)
+
+    assert db.verify_restaurant(999) is False
+
+
+def test_delete_restaurant_removes_its_history_too(tmp_path, monkeypatch):
+    """A wrong match's check history describes some other restaurant, so it
+    goes with the row rather than being left to skew a later rollup."""
+    restaurant_id = _seeded_restaurant(tmp_path, monkeypatch)
+    _log_check(restaurant_id, "2020-01-01 12:00:00")
+    db.prune_check_log(retain_days=0)
+    _log_check(restaurant_id, "2020-02-01 12:00:00")
+
+    assert db.delete_restaurant(restaurant_id) is True
+
+    assert db.get_restaurant(restaurant_id) is None
+    assert db.check_history(restaurant_id) == []
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM check_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM check_log_monthly").fetchone()[0] == 0
+
+
+def test_delete_restaurant_reports_a_missing_row(tmp_path, monkeypatch):
+    _seeded_restaurant(tmp_path, monkeypatch)
+
+    assert db.delete_restaurant(999) is False
+
+
+def test_migration_verifies_rows_that_were_already_being_checked(tmp_path, monkeypatch):
+    """A database written before verification existed holds restaurants the
+    user has been reading alerts about for months. Treating those as
+    unverified would silently stop watching all of them, so the column is
+    backfilled for anything with a check against it -- and only that."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    with db.get_conn() as conn:
+        # Rebuild the pre-migration table: same schema, minus the new column.
+        conn.execute("DROP TABLE restaurants")
+        conn.execute("""CREATE TABLE restaurants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            place_id TEXT UNIQUE NOT NULL, address TEXT, maps_url TEXT,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            business_status TEXT DEFAULT 'OPERATIONAL',
+            closing_soon_flag INTEGER DEFAULT 0, closing_soon_summary TEXT,
+            last_checked_at TEXT, archived INTEGER DEFAULT 0)""")
+        conn.execute("""INSERT INTO restaurants (name, place_id, last_checked_at)
+                        VALUES ('Watched', 'place-watched', '2020-01-01 12:00:00')""")
+        conn.execute("""INSERT INTO restaurants (name, place_id)
+                        VALUES ('Seeded but never checked', 'place-fresh')""")
+
+    db.init_db()
+
+    assert db.get_restaurant_by_place_id("place-watched")["verified_at"] is not None
+    assert db.get_restaurant_by_place_id("place-fresh")["verified_at"] is None

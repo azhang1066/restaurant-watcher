@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_status.html" import badges, unarchive_form %}
+{% from "_status.html" import badges, unarchive_form, verify_forms %}
 
 {% block content %}
   <h1>Restaurant Watcher</h1>
@@ -10,6 +10,7 @@
     <li><b>{{ summary.closing_soon }}</b><span>Closing soon</span></li>
     <li><b>{{ summary.closed }}</b><span>Closed</span></li>
     <li><b>{{ summary.archived }}</b><span>Archived</span></li>
+    {% if summary.unverified %}<li><b>{{ summary.unverified }}</b><span>To verify</span></li>{% endif %}
     {% if summary.stale %}<li><b>{{ summary.stale }}</b><span>Stale</span></li>{% endif %}
   </ul>
 
@@ -19,12 +20,43 @@
       {{ stale_after_days }}+ days &mdash; is the scheduler still running?</p>
   {% endif %}
 
+  {#- Above the add form on purpose: these are the restaurants the weekly
+      check is currently refusing to look at, which is worth knowing before
+      adding more. -#}
+  {% if pending %}
+    <div class="card pending">
+      <h2 style="margin: 0">{{ summary.unverified }}
+        restaurant{{ 's' if summary.unverified != 1 }} waiting to be verified</h2>
+      <p class="muted small" style="margin: .25rem 0 0">
+        Google answers a name search with exactly one guess and no confidence
+        beside it, so a wrong match looks just like a right one. These aren't
+        being checked at all until you confirm each is the place you meant.
+      </p>
+      <ul>
+        {% for r in pending %}
+          <li>
+            <a class="name" href="{{ url_for('detail', restaurant_id=r.id) }}">{{ r.name }}</a>
+            {% if r.address %}<div class="muted small">{{ r.address }}</div>{% endif %}
+            {% if r.maps_url %}
+              <div class="small"><a href="{{ r.maps_url }}" target="_blank"
+                rel="noopener noreferrer">Open on Google Maps</a> to be sure</div>
+            {% endif %}
+            <div style="margin-top: .45rem">{{ verify_forms(r, 'index') }}</div>
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
   {#- The one form on this site that costs money, so it says so, and it
       searches rather than adds -- the confirm page is where tracking starts. -#}
   <form class="add card" method="post" action="{{ url_for('add_search') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {#- `prefill` is set when a rejected match bounced back here: the name
+        stays, the address doesn't, since the address was the wrong place's. -#}
     <input class="text" type="text" name="name" required
-           maxlength="{{ max_query_chars }}"
+           maxlength="{{ max_query_chars }}" value="{{ prefill }}"
+           {% if prefill %}autofocus{% endif %}
            placeholder="Restaurant name" aria-label="Restaurant name">
     <input class="text" type="text" name="address_hint"
            maxlength="{{ max_query_chars }}"

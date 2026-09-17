@@ -5,6 +5,7 @@ load_dotenv() ran silently gave you the default topic and no email. Reading
 at call time is the fix; these tests pin it down by setting the environment
 *after* import, exactly as that bug required."""
 import smtplib
+from email.header import decode_header, make_header
 
 import notifier
 
@@ -49,6 +50,13 @@ def _patch_ntfy(monkeypatch):
         lambda url, **kwargs: posts.append({"url": url, **kwargs}),
     )
     return posts
+
+
+def _title(post):
+    """The Title header read back the way ntfy reads it: RFC 2047 in, the
+    original text out. Asserting on the raw header instead would pin the
+    encoding rather than what lands on the phone."""
+    return str(make_header(decode_header(post["headers"]["Title"])))
 
 
 def _clear_email_env(monkeypatch):
@@ -138,3 +146,84 @@ def test_email_failure_does_not_propagate(monkeypatch):
     notifier.notify("Title", "Body")  # must not raise
 
     assert len(posts) == 1  # the ntfy alert still went out
+
+
+def test_non_ascii_title_is_encoded_for_the_header(monkeypatch):
+    """Every title below carries an emoji, and ntfy takes the title as an
+    HTTP header -- which http.client encodes as latin-1. Unencoded, that
+    raised UnicodeEncodeError before the request left, so the alert was
+    lost and run_check logged it as a failed check. RFC 2047 is what ntfy
+    decodes back to the original text."""
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify("\U0001F6AB Lilia is permanently closed", "Body")
+
+    raw = posts[0]["headers"]["Title"]
+    raw.encode("latin-1")  # must not raise -- this is the bug itself
+    assert raw != "\U0001F6AB Lilia is permanently closed"   # it was encoded
+    # ...and it survives the round trip, so the phone still shows the emoji.
+    assert _title(posts[0]) == "\U0001F6AB Lilia is permanently closed"
+
+
+def test_ascii_title_is_left_alone(monkeypatch):
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify("Lilia is permanently closed", "Body")
+
+    assert posts[0]["headers"]["Title"] == "Lilia is permanently closed"
+
+
+def test_email_subject_keeps_the_original_title(monkeypatch):
+    """EmailMessage does its own encoding, so the subject gets the real text
+    rather than the wire-safe form built for the ntfy header."""
+    _clear_email_env(monkeypatch)
+    _patch_ntfy(monkeypatch)
+    fake = _patch_smtp(monkeypatch)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("EMAIL_FROM", "from@example.com")
+    monkeypatch.setenv("EMAIL_TO", "to@example.com")
+
+    notifier.notify("\U0001F6AB Lilia is permanently closed", "Body")
+
+    assert fake.instances[0].sent[0]["Subject"] == "\U0001F6AB Lilia is permanently closed"
+
+
+def test_needs_verification_push_is_one_message_for_the_batch(monkeypatch):
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify_needs_verification(
+        [{"name": "Lilia"}, {"name": "Don Angie"}, {"name": "Katz's"}])
+
+    assert len(posts) == 1
+    assert "3 restaurants to verify" in _title(posts[0])
+    body = posts[0]["data"].decode("utf-8")
+    assert "Lilia, Don Angie, Katz's" in body
+
+
+def test_needs_verification_push_caps_the_names_it_spells_out(monkeypatch):
+    """A seeded file can leave a hundred waiting; a lock screen shows two
+    lines."""
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+    names = [{"name": f"Place {n}"} for n in range(8)]
+
+    notifier.notify_needs_verification(names)
+
+    body = posts[0]["data"].decode("utf-8")
+    assert "Place 4" in body
+    assert "Place 5" not in body
+    assert "and 3 more" in body
+
+
+def test_needs_verification_push_links_to_the_dashboard(monkeypatch):
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+    monkeypatch.setenv("DASHBOARD_URL", "http://pi.local:5000")
+
+    notifier.notify_needs_verification([{"name": "Lilia"}])
+
+    assert posts[0]["headers"]["Click"] == "http://pi.local:5000"
+    assert "1 restaurant to verify" in _title(posts[0])  # singular

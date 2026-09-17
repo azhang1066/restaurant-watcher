@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_status.html" import badges, unarchive_form %}
+{% from "_status.html" import badges, unarchive_form, verify_forms %}
 
 {% block title %}{{ restaurant.name }} &mdash; Restaurant Watcher{% endblock %}
 
@@ -12,6 +12,19 @@
     {% if restaurant.address %}<br>{{ restaurant.address }}{% endif %}
     {% if restaurant.maps_url %}<br><a href="{{ restaurant.maps_url }}">View on Google Maps</a>{% endif %}
   </p>
+
+  {% if restaurant.needs_verification %}
+    <div class="card pending">
+      <p style="margin: 0"><b>Is this the right place?</b></p>
+      <p class="muted small" style="margin: .25rem 0 .6rem">
+        Nothing has been checked here yet, and nothing will be until you say
+        this is the restaurant you meant &mdash; a name search returns one
+        guess, and the wrong one watches just as happily as the right one.
+        Check the address above.
+      </p>
+      {{ verify_forms(restaurant, 'detail') }}
+    </div>
+  {% endif %}
 
   {% if restaurant.archived %}
     <p class="sub">

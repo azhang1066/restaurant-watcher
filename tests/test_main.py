@@ -29,7 +29,8 @@ def _news(closing_soon, confidence="high", summary=""):
     return {"closing_soon": closing_soon, "confidence": confidence, "summary": summary}
 
 
-def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),)):
+def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),),
+           verified=True):
     """Point db and the run counter at tmp_path, then seed restaurants.
 
     The run counter is a file in the real data/ directory, so leaving it
@@ -37,6 +38,11 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),)):
     Cadence/retention env vars are cleared for the same reason: main reads
     them at call time, so a developer's .env would otherwise steer the tests
     that rely on the defaults.
+
+    Seeded restaurants are verified unless a test says otherwise, because
+    run_check skips unverified ones outright -- leaving them unverified would
+    quietly turn every notification test below into a test that nothing is
+    checked at all. The tests that *are* about that opt in explicitly.
     """
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
@@ -44,7 +50,8 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),)):
         monkeypatch.delenv(var, raising=False)
     db.init_db()
     for name, place_id in restaurants:
-        db.add_restaurant(name, place_id, address=f"{name} address")
+        db.add_restaurant(name, place_id, address=f"{name} address",
+                          verified=verified)
 
 
 def _patch_places(monkeypatch, by_place_id):
@@ -93,6 +100,20 @@ def _patch_notifiers(monkeypatch, closed_raises=None):
     monkeypatch.setattr(main, "notify_closing_soon",
                         lambda r, summary: closing_soon.append((r["name"], summary)))
     return closed, closing_soon
+
+
+def _patch_verify_notifier(monkeypatch, raises=None):
+    """Fake the needs-verifying push. Records one entry per *run* that sent
+    one, holding the names it covered -- the batching is the behaviour."""
+    sent = []
+
+    def _fake(restaurants):
+        if raises is not None:
+            raise raises
+        sent.append([r["name"] for r in restaurants])
+
+    monkeypatch.setattr(main, "notify_needs_verification", _fake)
+    return sent
 
 
 def _row(name):
@@ -567,3 +588,120 @@ def test_pruning_failure_does_not_fail_a_run_whose_checks_landed(tmp_path, monke
 
     assert closed == [("Lilia", "CLOSED_PERMANENTLY")]
     assert _row("Lilia")["archived"] == 1
+
+
+# --- verification gate --------------------------------------------------
+
+def test_unverified_restaurant_is_not_checked_at_all(tmp_path, monkeypatch):
+    """The whole point of the gate: an unconfirmed place_id might be some
+    other restaurant, so nothing is spent on it and nothing is stored about
+    it -- not the cheap Places poll, not the expensive news check."""
+    _setup(tmp_path, monkeypatch, verified=False)
+    places = _patch_places(monkeypatch, {"place-lilia": "CLOSED_PERMANENTLY"})
+    news = _patch_news(monkeypatch)
+    closed, closing_soon = _patch_notifiers(monkeypatch)
+    _patch_verify_notifier(monkeypatch)
+
+    main.run_check(include_news_check=True)
+
+    assert places == []
+    assert news == []
+    assert (closed, closing_soon) == ([], [])
+    row = _row("Lilia")
+    assert row["last_checked_at"] is None
+    assert row["archived"] == 0        # a closure it never saw can't archive it
+    assert db.check_history(row["id"]) == []
+
+
+def test_verified_restaurants_are_checked_alongside_unverified_ones(tmp_path, monkeypatch):
+    """One unverified row holds up only itself, not the rest of the list."""
+    _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),),
+           verified=True)
+    db.add_restaurant("Don Angie", "place-don-angie", address="Don Angie address")
+    places = _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    sent = _patch_verify_notifier(monkeypatch)
+
+    main.run_check()
+
+    assert places == ["place-lilia"]
+    assert _row("Lilia")["last_checked_at"] is not None
+    assert _row("Don Angie")["last_checked_at"] is None
+    assert sent == [["Don Angie"]]
+
+
+def test_verifying_a_restaurant_lets_the_next_run_check_it(tmp_path, monkeypatch):
+    """The gate lifts on the flag alone -- nothing else about the row moves."""
+    _setup(tmp_path, monkeypatch, verified=False)
+    places = _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    _patch_verify_notifier(monkeypatch)
+
+    main.run_check()
+    assert places == []
+
+    db.verify_restaurant(_row("Lilia")["id"])
+    main.run_check()
+
+    assert places == ["place-lilia"]
+
+
+def test_one_verification_push_per_run_however_many_are_waiting(tmp_path, monkeypatch):
+    """Batched on purpose: seeding a file shouldn't mean a push per line."""
+    _setup(tmp_path, monkeypatch,
+           restaurants=(("Lilia", "place-lilia"), ("Don Angie", "place-don-angie"),
+                        ("Katz's", "place-katz")),
+           verified=False)
+    _patch_places(monkeypatch, {})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    sent = _patch_verify_notifier(monkeypatch)
+
+    main.run_check()
+
+    assert len(sent) == 1
+    assert sorted(sent[0]) == ["Don Angie", "Katz's", "Lilia"]
+
+
+def test_no_verification_push_when_nothing_is_waiting(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    sent = _patch_verify_notifier(monkeypatch)
+
+    main.run_check()
+
+    assert sent == []
+
+
+def test_verification_push_failure_does_not_fail_the_run(tmp_path, monkeypatch):
+    """Same rule as the housekeeping below it: a dead ntfy must not throw away
+    check results that already landed in the database."""
+    _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),))
+    db.add_restaurant("Don Angie", "place-don-angie")
+    _patch_places(monkeypatch, {"place-lilia": "CLOSED_TEMPORARILY"})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    _patch_verify_notifier(monkeypatch, raises=RuntimeError("ntfy is down"))
+
+    main.run_check()  # must not raise
+
+    assert _row("Lilia")["business_status"] == "CLOSED_TEMPORARILY"
+
+
+def test_archived_unverified_restaurant_is_not_nagged_about(tmp_path, monkeypatch):
+    """run_check only ever reads the active list, so an archived row can't be
+    pushed about -- the dashboard's "needs verifying" has to agree."""
+    _setup(tmp_path, monkeypatch, verified=False)
+    db.archive_restaurant(_row("Lilia")["id"])
+    _patch_places(monkeypatch, {})
+    _patch_news(monkeypatch)
+    _patch_notifiers(monkeypatch)
+    sent = _patch_verify_notifier(monkeypatch)
+
+    main.run_check()
+
+    assert sent == []

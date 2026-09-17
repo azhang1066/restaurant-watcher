@@ -5,6 +5,7 @@ and, optionally, email via SMTP.
 import logging
 import os
 import smtplib
+from email.header import Header
 from email.message import EmailMessage
 
 import requests
@@ -14,6 +15,12 @@ from urllib3.util.retry import Retry
 logger = logging.getLogger(__name__)
 
 DEFAULT_NTFY_TOPIC = "restaurant-watcher-changeme"
+DEFAULT_DASHBOARD_URL = "http://127.0.0.1:5000"
+
+# How many names to spell out before the rest become a count. A push
+# notification gets a couple of lines on a lock screen, and a seeded file
+# can leave a hundred restaurants waiting at once.
+NAMES_IN_VERIFY_PUSH = 5
 
 _session = requests.Session()
 _retry = Retry(
@@ -29,6 +36,12 @@ def _ntfy_url():
     """Read at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern."""
     return f"https://ntfy.sh/{os.environ.get('NTFY_TOPIC', DEFAULT_NTFY_TOPIC)}"
+
+
+def _dashboard_url():
+    """Where to send someone who taps the verify notification. Read at call
+    time for the same reason as `_ntfy_url()`."""
+    return os.environ.get("DASHBOARD_URL") or DEFAULT_DASHBOARD_URL
 
 
 def _email_settings():
@@ -50,11 +63,30 @@ def _email_settings():
     }
 
 
+def _header_value(value):
+    """An HTTP header value latin-1 can carry, RFC 2047-encoded if it can't.
+
+    ntfy takes the title and click URL as headers, and http.client encodes
+    header values as latin-1 -- so the emoji in every title below raised
+    UnicodeEncodeError before the request was ever sent, and the alert was
+    lost. ntfy decodes RFC 2047 encoded-words back to the original text, so
+    the phone still shows the emoji. Only the body is exempt: it's the
+    request payload, sent as UTF-8.
+    """
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return Header(value, "utf-8").encode()
+    return value
+
+
 def notify(title, message, priority="default", url=None):
-    headers = {"Title": title, "Priority": priority}
+    headers = {"Title": _header_value(title), "Priority": priority}
     if url:
-        headers["Click"] = url
+        headers["Click"] = _header_value(url)
     _session.post(_ntfy_url(), data=message.encode("utf-8"), headers=headers, timeout=10)
+    # The email subject is set through EmailMessage, which does its own
+    # encoding -- so it gets the original title, not the wire-safe one.
     _send_email(title, message, url)
 
 
@@ -96,4 +128,27 @@ def notify_closing_soon(restaurant, summary):
         message=summary or "Recent coverage suggests a closure is coming.",
         priority="default",
         url=restaurant.get("maps_url"),
+    )
+
+
+def notify_needs_verification(restaurants):
+    """One push per run covering everything waiting to be verified.
+
+    Deliberately batched rather than one push per restaurant: seeding a file
+    of two hundred names would otherwise empty the phone's battery to say a
+    single thing. The trade is that this re-fires every run while anything is
+    unverified -- which is the point, since those restaurants aren't being
+    checked at all until they're confirmed.
+    """
+    count = len(restaurants)
+    names = [r["name"] for r in restaurants]
+    shown = ", ".join(names[:NAMES_IN_VERIFY_PUSH])
+    if count > NAMES_IN_VERIFY_PUSH:
+        shown += f", and {count - NAMES_IN_VERIFY_PUSH} more"
+    notify(
+        title=f"📍 {count} restaurant{'s' if count != 1 else ''} to verify",
+        message=f"{shown}\n\nNot being checked until you confirm each one is the "
+                f"right place on the dashboard.",
+        priority="default",
+        url=_dashboard_url(),
     )

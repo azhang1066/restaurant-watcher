@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
     closing_soon_flag INTEGER DEFAULT 0,           -- 1 if news check found a closure signal
     closing_soon_summary TEXT,
     last_checked_at TEXT,
-    archived INTEGER DEFAULT 0                     -- 1 once we've notified + user has acknowledged
+    archived INTEGER DEFAULT 0,                    -- 1 once we've notified + user has acknowledged
+    verified_at TEXT                               -- when the user confirmed this place_id is the right location; NULL until then
 );
 
 CREATE TABLE IF NOT EXISTS check_log (
@@ -66,9 +67,31 @@ def get_conn():
         conn.close()
 
 
+def _migrate(conn):
+    """Add columns the schema gained after rows already existed.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a new
+    column has to be ALTERed in. Guarded by a lookup rather than a version
+    number: there is one of these, and a `PRAGMA` is cheaper than a table to
+    track it.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")}
+    if "verified_at" not in columns:
+        conn.execute("ALTER TABLE restaurants ADD COLUMN verified_at TEXT")
+        # Backfill anything already being watched. Unverified rows are
+        # skipped by run_check, so treating a restaurant that has been
+        # checked for months as suddenly unverified would silently stop
+        # watching it -- and there is nothing new to tell the user about a
+        # place they have been reading alerts about. Never-checked rows keep
+        # the NULL and get asked about, which is exactly the new behaviour.
+        conn.execute("""UPDATE restaurants SET verified_at = COALESCE(added_at, CURRENT_TIMESTAMP)
+                        WHERE verified_at IS NULL AND last_checked_at IS NOT NULL""")
+
+
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         # Settle any closing-soon flag left set on a permanently closed row.
         # main.run_check() clears the flag as the closure lands, but rows
         # written before it did that are unreachable by it: a permanent
@@ -81,12 +104,20 @@ def init_db():
         )
 
 
-def add_restaurant(name, place_id, address=None, maps_url=None):
+def add_restaurant(name, place_id, address=None, maps_url=None, verified=False):
+    """Insert a restaurant, ignoring the insert if its place_id is already known.
+
+    `verified` records that the caller already showed the user which place
+    this is and got a yes -- what the dashboard's confirm step does. It
+    defaults to False because the other caller, seed.py, resolves a whole
+    file of names with nobody looking; those rows get asked about before
+    they're ever checked (see main.run_check).
+    """
     with get_conn() as conn:
         conn.execute(
-            """INSERT OR IGNORE INTO restaurants (name, place_id, address, maps_url)
-               VALUES (?, ?, ?, ?)""",
-            (name, place_id, address, maps_url),
+            """INSERT OR IGNORE INTO restaurants (name, place_id, address, maps_url, verified_at)
+               VALUES (?, ?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP END)""",
+            (name, place_id, address, maps_url, int(bool(verified))),
         )
 
 
@@ -166,6 +197,40 @@ def unarchive_restaurant(restaurant_id):
             "UPDATE restaurants SET archived = 0 WHERE id = ?", (restaurant_id,)
         ).rowcount
     return changed > 0
+
+
+def verify_restaurant(restaurant_id):
+    """Record that the user confirmed this row points at the right place.
+
+    Returns True if a row was newly verified, False if it was already
+    verified or doesn't exist. The timestamp is only ever written once, so a
+    double-submitted form reports the repeat rather than moving the date.
+    """
+    with get_conn() as conn:
+        changed = conn.execute(
+            """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND verified_at IS NULL""",
+            (restaurant_id,),
+        ).rowcount
+    return changed > 0
+
+
+def delete_restaurant(restaurant_id):
+    """Remove a restaurant and everything logged about it. Returns True if a
+    row went, False if there was no such restaurant.
+
+    This is for a row that was never the right place to begin with, which is
+    why it deletes rather than archives: its check history describes some
+    other restaurant, so keeping it would put wrong numbers on the page
+    forever. Archiving is the tool for a place that really did close.
+    """
+    with get_conn() as conn:
+        conn.execute("DELETE FROM check_log WHERE restaurant_id = ?", (restaurant_id,))
+        conn.execute("DELETE FROM check_log_monthly WHERE restaurant_id = ?", (restaurant_id,))
+        removed = conn.execute(
+            "DELETE FROM restaurants WHERE id = ?", (restaurant_id,)
+        ).rowcount
+    return removed > 0
 
 
 def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):

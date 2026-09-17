@@ -43,6 +43,11 @@ Katz's Delicatessen, Manhattan
 python seed.py restaurants.txt
 ```
 
+Seeding resolves each line through Google Places and takes the first hit, with
+nobody looking at any of them -- so seeded restaurants land **unverified** and
+are not checked until you confirm each one on the dashboard. See
+[Verifying a restaurant](#verifying-a-restaurant).
+
 ## Run
 
 ```bash
@@ -59,8 +64,7 @@ leaving a terminal open.
 A local page over whatever the checks have recorded:
 
 ```bash
-flask --app app run     # http://127.0.0.1:5000
-python app.py           # same thing
+python app.py           # http://127.0.0.1:5000
 ```
 
 The index lists every tracked restaurant -- closures and closing-soon
@@ -73,6 +77,37 @@ Archived restaurants stay listed, greyed out, rather than disappearing.
 Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
 has quietly died otherwise looks just like a week with no bad news.
 
+### Verifying a restaurant
+
+A name search returns exactly one guess with no confidence beside it, so the
+wrong "Lilia" gets watched just as happily as the right one -- and looks
+identical once it's in the table. A restaurant is therefore **not checked at
+all** until you've confirmed it points at the place you meant.
+
+Unverified restaurants collect at the top of the index with their name,
+address and a Maps link, and two buttons:
+
+- **Yes, that's the place** -- starts checking it from the next run onward.
+  Nothing else about the row changes.
+- **Wrong place -- remove it** -- deletes the row and its history and reopens
+  the search with the name filled in (but not the address, which belonged to
+  the wrong place). Deleting rather than archiving is deliberate: its check
+  history describes a different restaurant. This only works on an unverified
+  row; a restaurant you confirmed long ago can't be deleted from a stale tab.
+
+Until then nothing is spent on them -- no Places call, no Claude call -- and
+no alert can fire about them, since an alert about the wrong restaurant is
+exactly what this is here to prevent. Each run sends **one** push saying how
+many are waiting (not one per restaurant, so seeding a long file doesn't empty
+your battery), linking to `DASHBOARD_URL`.
+
+Restaurants added through the dashboard's search box skip all this: the
+confirm page **is** the verification, so they're stored already verified.
+
+Upgrading an existing database is handled automatically -- anything that had
+already been checked is treated as verified, since you've been reading its
+alerts for months. Only never-checked rows get asked about.
+
 ### Adding a restaurant
 
 The search box at the top of the index takes a name and, optionally, a city
@@ -83,7 +118,9 @@ is tracked until you press **Track this restaurant** on that page.
 The confirm step is not ceremony. Text Search always answers with its one
 best guess and no confidence alongside it, so a mistyped or ambiguous name
 comes back as a real restaurant somewhere else, and a wrong one being watched
-looks exactly like a right one. The address is what tells them apart.
+looks exactly like a right one. The address is what tells them apart. It's the
+same question [verification](#verifying-a-restaurant) asks of seeded rows --
+asked before the row is written rather than after.
 
 This is also the only button here that spends money -- one Text Search call
 per search, the same call `seed.py` makes per line -- so the search is a POST
@@ -125,6 +162,9 @@ Checks themselves still run from `main.py`.
 2. **Closing soon** (every Nth run, costs more): Claude API with web
    search looks for recent news of an announced closure. Runs less often
    (default: every 4th check) since it's a heavier, fuzzier signal.
+
+Both steps are skipped entirely for a restaurant you haven't verified yet;
+see [Verifying a restaurant](#verifying-a-restaurant).
 
 Permanent closures auto-archive the restaurant after notifying; temporary
 closures and closing-soon flags stay active so you keep getting the

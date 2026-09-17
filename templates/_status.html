@@ -1,13 +1,21 @@
 {#- Status + closing-soon badges for one restaurant. Shared so the list and
     detail pages can never disagree about what a row's state looks like. -#}
 {% macro badges(r) -%}
-  {% if r.status == 'OPERATIONAL' %}
-    <span class="badge ok">{{ r.status_label }}</span>
-  {% elif r.status == 'CLOSED_TEMPORARILY' %}
-    <span class="badge warn">{{ r.status_label }}</span>
-  {% else %}
-    <span class="badge bad">{{ r.status_label }}</span>
+  {#- status_known, not the status itself: the column defaults to OPERATIONAL,
+      so a row nobody has checked would otherwise claim to be open on the
+      strength of a default -- and an unverified one is never checked. -#}
+  {% if r.status_known %}
+    {% if r.status == 'OPERATIONAL' %}
+      <span class="badge ok">{{ r.status_label }}</span>
+    {% elif r.status == 'CLOSED_TEMPORARILY' %}
+      <span class="badge warn">{{ r.status_label }}</span>
+    {% else %}
+      <span class="badge bad">{{ r.status_label }}</span>
+    {% endif %}
+  {% elif not r.needs_verification %}
+    <span class="badge muted">Not checked yet</span>
   {% endif %}
+  {% if r.needs_verification %}<span class="badge warn">Needs verifying</span>{% endif %}
   {#- closing_soon_current, not the raw flag: the view drops the badge once a
       place is shut for good (see _view). Still shown alongside a temporary
       closure, where "and it's not coming back" is the whole point. -#}
@@ -23,5 +31,23 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="return_to" value="{{ return_to }}">
     <button class="action" type="submit">Re-activate</button>
+  </form>
+{%- endmacro %}
+
+{#- Confirm-or-discard buttons for a restaurant nobody has vouched for yet.
+    Two forms, because they're two routes: verifying comes back to the page it
+    was pressed on, while rejecting deletes the row and so has nowhere to come
+    back to -- it lands on the search box instead, name filled in. -#}
+{% macro verify_forms(r, return_to) -%}
+  <form class="inline" method="post"
+        action="{{ url_for('verify', restaurant_id=r.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="action" type="submit">Yes, that's the place</button>
+  </form>
+  <form class="inline" method="post"
+        action="{{ url_for('reject', restaurant_id=r.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="action danger" type="submit">Wrong place &mdash; remove it</button>
   </form>
 {%- endmacro %}

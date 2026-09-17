@@ -70,6 +70,7 @@
       border-radius: 6px; padding: .2rem .55rem;
     }
     button.action:hover { border-color: var(--accent); color: var(--accent); }
+    button.action.danger:hover { border-color: var(--bad); color: var(--bad); }
     form.inline { display: inline; margin: 0; }
     form.add {
       display: flex; flex-wrap: wrap; gap: .5rem; align-items: center;
@@ -82,6 +83,10 @@
     }
     input.text:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .name { font-weight: 600; }
+    .pending { padding: .9rem; margin: 0 0 1.5rem; border-left: 3px solid var(--warn); }
+    .pending ul { list-style: none; margin: .75rem 0 0; padding: 0; }
+    .pending li { padding: .6rem 0; border-top: 1px solid var(--line); }
+    .pending li:first-child { border-top: 0; padding-top: 0; }
     .summary-text { margin: .2rem 0 0; max-width: 34rem; }
     @media (max-width: 40rem) {
       th, td { padding: .5rem .6rem; }
