@@ -173,9 +173,14 @@ that rejecting a *verified* row is a 400, and that neither runs without CSRF or 
 GET. `test_notifier.py` gained the round trip that the emoji-title bug broke — the
 header has to be latin-1 safe *and* decode back to the original text.
 
-141 tests, all passing (`app` 62, `main` 34, `db` 19, `notifier` 12, `closure_checker` 8,
-`places_client` 6). `seed.py` and the HTTP halves of `places_client.py` remain
-uncovered — faking `requests` there would only assert the mock.
+144 tests, all passing (`app` 62, `main` 34, `db` 19, `notifier` 12, `closure_checker` 8,
+`places_client` 6, `seed` 3). The HTTP halves of `places_client.py` remain uncovered — faking
+`requests` there would only assert the mock. `tests/test_seed.py` covers
+seed.py's wiring rather than its network half: that it loads `.env` at import
+(it didn't, so seeding failed asking for a key that was already in `.env` —
+it was the one entry point that never called `load_dotenv()`), that seeded
+rows land unverified, and that an unresolvable line is skipped rather than
+fatal.
 
 ### External API integrations
 - **Google Places API (New)** — the only restaurant-status source today. Two calls:
@@ -203,6 +208,12 @@ uncovered — faking `requests` there would only assert the mock.
 - The add flow has no rate limit — nothing stops a held-down Enter key from running one Text Search per submit. Acceptable for one user pressing a button on localhost, and the first thing to revisit if this is ever exposed or scripted.
 - It's served by Flask's development server. Fine for a personal tool on localhost; a real deployment needs a WSGI server in front.
 - CSRF tokens live in a session cookie signed with `DASHBOARD_SECRET_KEY`. Unset, a per-process key is generated and open pages stop working after a restart (a reload fixes it). That's the right trade for one user on localhost and the wrong one the moment the app is served to anything else.
+- **Verifying is one-at-a-time, and `restaurants.txt` is 531 lines.** Seeding the
+  real file would leave 531 rows to click through individually, with `run_check`
+  checking none of them until that's done. A "verify all" (or verify-by-page) action
+  is the obvious escape hatch and isn't built; whether it's wanted depends on whether
+  the list is trusted in bulk, which rather defeats the point for the ambiguous names
+  in it. Worth deciding before seeding, not after.
 - The needs-verifying push re-fires every run while anything is waiting. That's the
   design (those restaurants aren't being watched, so the nag is the point) and it's
   self-limiting at one push a week, but it's the first thing to revisit if a seeded
@@ -240,6 +251,8 @@ routine reason left to touch a terminal is running the checks. One action is sti
 1. Commit the verification gate and the ntfy header fix (`db.py`, `main.py`, `notifier.py`, `app.py`, `templates/`, `tests/`, README + `.env.example`) — the tree has been clean at every other checkpoint.
 2. **Confirm an alert actually arrives on the phone.** The emoji-title bug means no ntfy notification this tool has ever sent can have been delivered — `run_check` caught the `UnicodeEncodeError` inside the per-restaurant `except` and logged it as a failed check. Worth one deliberate `notify()` against the real topic to prove the fix end to end, since every test fakes the POST.
 3. Use the add form against the real Places API with a real key. Every test fakes `find_place_id`, so the response *shape* (`displayName.text`, `formattedAddress`, `googleMapsUri` all present on a real hit) is assumed, not verified — and a deliberately ambiguous query is the way to see whether the confirm page actually gives you enough to catch a wrong match.
-4. Seed the DB and triage the verify queue against real data. `data/restaurants.db` exists but holds 0 rows, so the dashboard has only ever been rendered against fixtures — and a full `restaurants.txt` is also the first real test of whether clicking through a long pending list is tolerable, or whether it needs a "verify all" escape hatch.
+4. Seed the DB and triage the verify queue against real data. Note `restaurants.txt`
+   is 531 lines — that's 531 Text Search calls (order of $15-20) and 531 rows to
+   verify by hand, so trim it or build a bulk-verify action first. `data/restaurants.db` exists but holds 0 rows, so the dashboard has only ever been rendered against fixtures — and a full `restaurants.txt` is also the first real test of whether clicking through a long pending list is tolerable, or whether it needs a "verify all" escape hatch.
 5. Decide whether "force a check now" is wanted before Phase 1, and if so how it avoids hanging a request thread (background thread, a job row the scheduler picks up, or restricting the button to the cheap Places half).
 6. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
