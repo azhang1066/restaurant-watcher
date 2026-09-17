@@ -1,24 +1,26 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-16, against the single "Initial commit" (8 files, ~425 lines)._
-_Updated same day: `.gitignore` added and `main.py` hardened (try/except + logging) —
-see Phase 1 status below._
+_Last reviewed: 2026-09-17, against 4 commits through `f7e66b6` ("Adding log pruning")
+plus uncommitted work — 7 modules + 3 test files, ~960 lines. This plan tracks open work
+only; finished items (HTTP retries, the test suite, email notifications, log pruning,
+call-time config) are dropped once done — see git history for what landed._
 
 ## 1. Technical Overview
 
 **Stack:** Python 3.13, SQLite (stdlib `sqlite3`), `requests` for HTTP, `anthropic` SDK,
-`apscheduler` for the weekly loop, `python-dotenv` for config. `flask` is listed in
-`requirements.txt` but **not used anywhere** — dead dependency, no web server exists yet.
+`apscheduler` for the weekly loop, `python-dotenv` for config, `pytest` for tests.
+`flask` is listed in `requirements.txt` but **still not used anywhere** — dead
+dependency, no web server exists yet (see Phase 2).
 
 **Core components** (one file each, no package structure):
 
 | File | Role |
 |---|---|
-| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run. |
-| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). |
-| `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (seed-time text search) and `get_business_status` (per-run cheap status poll). |
+| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. |
+| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()` and `check_history()`. |
+| `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (seed-time text search) and `get_business_status` (per-run cheap status poll). Retries via a `urllib3` `Retry` adapter. |
 | `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. |
-| `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth). |
+| `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth) and, optionally, by email over SMTP. |
 | `seed.py` | One-time/occasional CLI: reads a text file of restaurant names, resolves each to a Google `place_id`, inserts into the DB. |
 
 **How they fit together:**
@@ -38,6 +40,7 @@ flowchart TD
     main -->|prune_check_log: fold aged rows into rollups| db
     main -->|status changed?| notifier["notifier.py"]
     notifier -->|HTTP POST| ntfy[(ntfy.sh topic)]
+    notifier -->|"SMTP (optional)"| mail[(Email inbox)]
     ntfy --> phone["Phone (ntfy app)"]
 ```
 
@@ -58,6 +61,8 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
    - Write the result to `restaurants` (current state) and append a row to `check_log`
      (history/audit trail).
    - Compare new status to the previously stored status to decide whether to notify.
+   - A per-restaurant failure is caught, logged with a traceback and counted, so one bad
+     restaurant never aborts the run; the tally is logged at the end.
    - After the loop, `prune_check_log()` folds aged-out `check_log` rows into
      `check_log_monthly` (housekeeping only -- a failure here is logged, not fatal).
 3. **Permanent closures auto-archive** the restaurant (`archived = 1`, excluded from
@@ -74,15 +79,21 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
   - **No Resy or OpenTable integration exists in this codebase.** `notifier.py`'s
     docstring references sharing an ntfy topic with "the reservation notifier," implying
     a separate/sibling tool the user has elsewhere — but reservation-availability
-    watching (Resy/OpenTable) is not implemented here. See Phase 2 below.
+    watching (Resy/OpenTable) is not implemented here. See Phase 1 below.
 - **Anthropic API** — `claude-sonnet-4-6` with the `web_search_20250305` tool, used
   only for the low-frequency "closing soon" judgment call. Prompted for strict JSON;
   `closure_checker.py` defensively extracts the `{...}` substring since the model
   sometimes wraps it in prose.
 
 ### Notification pipeline
-- `notifier.py` is a stateless HTTP POST to `https://ntfy.sh/{NTFY_TOPIC}` — no
-  delivery confirmation, no retry, no auth (topic name is the only "secret").
+- `notifier.py` fans one `notify()` call out to two sinks:
+  - **ntfy** — HTTP POST to `https://ntfy.sh/{NTFY_TOPIC}`, no auth (the topic name is
+    the only "secret"), no delivery confirmation. Retries on 429/5xx via the shared
+    session adapter.
+  - **Email (optional)** — SMTP with STARTTLS, active only when `SMTP_HOST`,
+    `EMAIL_FROM` (or `SMTP_USER`) and `EMAIL_TO` are all set; `_email_settings()`
+    returns `None` otherwise and the send is skipped. Failures are caught and logged,
+    so a broken mail server never breaks the ntfy alert or the run.
 - Two notification types: `notify_closed` (high priority, fires on any transition into
   `CLOSED_TEMPORARILY`/`CLOSED_PERMANENTLY`) and `notify_closing_soon` (default
   priority, fires once when the flag flips from unset to set — it does not re-fire on
@@ -90,7 +101,14 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
 - No dedup/backoff beyond the state-transition check in `main.py`; no notification log.
 
 ### Gaps / risks worth knowing about
-  — the SDK has its own retry defaults, worth confirming separately if this keeps failing.
+- **`closure_checker.py` has no retry story of its own.** `places_client.py` and
+  `notifier.py` both mount a `urllib3` `Retry` adapter (3 retries, exponential backoff,
+  on 429/500/502/503/504), but `closure_checker.py` goes through the `anthropic` SDK
+  rather than raw `requests` and just inherits whatever the SDK's defaults are — worth
+  confirming if news checks start failing.
+- **Nothing tests `main.run_check`** — the orchestration, the transition-to-notify logic
+  and the per-restaurant failure isolation are all uncovered; tests stop at `db`,
+  `closure_checker` and `notifier`.
 - `flask` dependency is unused — either build the dashboard it implies (Phase 2) or drop it.
 
 ## 3. Phased Work Plan
@@ -112,6 +130,7 @@ is a sibling concern:
 ### Phase 2 — Minimal dashboard (justifies the `flask` dependency)
 - Single-page Flask view: list of tracked restaurants with current status, last
   checked time, and closing-soon summaries pulled straight from `db.py`.
+  `check_history()` already returns per-month rollups suited to a history panel.
 - Manual actions: add a restaurant (wraps `seed.py`'s logic instead of editing a text
   file), re-activate an archived one, force a check now.
 - If this isn't wanted, remove `flask` from `requirements.txt` instead — don't leave
@@ -124,9 +143,8 @@ is a sibling concern:
   news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. Decide Resy/OpenTable scope for Phase 2 (which platform first, what auth approach) —
+1. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) —
    this is the biggest unknown and worth a short spike before committing to a design.
-2. Decide `flask`'s fate: build Phase 3's minimal dashboard, or drop the dependency.
-3. Stage and commit the accumulated Phase 1 work (`.gitignore`, `conftest.py`, `tests/`,
-   `main.py`/`places_client.py`/`notifier.py`/`requirements.txt` changes) — nothing has
-   been committed yet.
+2. Decide `flask`'s fate: build Phase 2's minimal dashboard, or drop the dependency.
+3. Add a `run_check` test covering notify-on-transition and per-restaurant failure
+   isolation — the last uncovered logic in the repo.

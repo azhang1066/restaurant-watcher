@@ -13,16 +13,7 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "restaurant-watcher-changeme")
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
-
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
-EMAIL_TO = os.environ.get("EMAIL_TO")
-EMAIL_ENABLED = bool(SMTP_HOST and EMAIL_FROM and EMAIL_TO)
+DEFAULT_NTFY_TOPIC = "restaurant-watcher-changeme"
 
 _session = requests.Session()
 _retry = Retry(
@@ -34,28 +25,56 @@ _retry = Retry(
 _session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
+def _ntfy_url():
+    """Read at call time, not import time, so `.env` lands however this module
+    was imported -- see `places_client._api_key()` for the same pattern."""
+    return f"https://ntfy.sh/{os.environ.get('NTFY_TOPIC', DEFAULT_NTFY_TOPIC)}"
+
+
+def _email_settings():
+    """SMTP config, or None when email isn't configured (host/from/to are the
+    required trio). Read at call time for the same reason as `_ntfy_url()`."""
+    user = os.environ.get("SMTP_USER")
+    host = os.environ.get("SMTP_HOST")
+    sender = os.environ.get("EMAIL_FROM") or user
+    to = os.environ.get("EMAIL_TO")
+    if not (host and sender and to):
+        return None
+    return {
+        "host": host,
+        "port": int(os.environ.get("SMTP_PORT") or 587),
+        "user": user,
+        "password": os.environ.get("SMTP_PASSWORD"),
+        "sender": sender,
+        "to": to,
+    }
+
+
 def notify(title, message, priority="default", url=None):
     headers = {"Title": title, "Priority": priority}
     if url:
         headers["Click"] = url
-    _session.post(NTFY_URL, data=message.encode("utf-8"), headers=headers, timeout=10)
+    _session.post(_ntfy_url(), data=message.encode("utf-8"), headers=headers, timeout=10)
     _send_email(title, message, url)
 
 
 def _send_email(subject, message, url=None):
-    if not EMAIL_ENABLED:
-        return
-    body = f"{message}\n\n{url}" if url else message
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg.set_content(body)
+    # Everything below is best-effort: a misconfigured or unreachable mail
+    # server must not take down the ntfy alert that already went out.
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+        cfg = _email_settings()
+        if cfg is None:
+            return
+        body = f"{message}\n\n{url}" if url else message
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = cfg["sender"]
+        msg["To"] = cfg["to"]
+        msg.set_content(body)
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=10) as server:
             server.starttls()
-            if SMTP_USER and SMTP_PASSWORD:
-                server.login(SMTP_USER, SMTP_PASSWORD)
+            if cfg["user"] and cfg["password"]:
+                server.login(cfg["user"], cfg["password"])
             server.send_message(msg)
     except Exception:
         logger.exception("Email notification failed")
