@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "_status.html" import badges, unarchive_form %}
+
+{% block content %}
+  <h1>Restaurant Watcher</h1>
+  <p class="sub">Everything the weekly check knows, newest concerns first.</p>
+
+  <ul class="stats">
+    <li><b>{{ summary.active }}</b><span>Tracked</span></li>
+    <li><b>{{ summary.closing_soon }}</b><span>Closing soon</span></li>
+    <li><b>{{ summary.closed }}</b><span>Closed</span></li>
+    <li><b>{{ summary.archived }}</b><span>Archived</span></li>
+    {% if summary.stale %}<li><b>{{ summary.stale }}</b><span>Stale</span></li>{% endif %}
+  </ul>
+
+  {% if summary.stale %}
+    <p class="sub">{{ summary.stale }} restaurant{{ 's' if summary.stale != 1 }}
+      {{ "haven't" if summary.stale != 1 else "hasn't" }} been checked in
+      {{ stale_after_days }}+ days &mdash; is the scheduler still running?</p>
+  {% endif %}
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Restaurant</th>
+          <th>Status</th>
+          <th class="hide-narrow">Last checked</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in restaurants %}
+          <tr {% if r.archived %}class="row-archived"{% endif %}>
+            <td class="keep">
+              <a class="name" href="{{ url_for('detail', restaurant_id=r.id) }}">{{ r.name }}</a>
+              {% if r.address %}<div class="muted small">{{ r.address }}</div>{% endif %}
+              {% if r.closing_soon and r.closing_soon_summary %}
+                <p class="summary-text small">{{ r.closing_soon_summary }}</p>
+              {% endif %}
+            </td>
+            <td>
+              {{ badges(r) }}
+              {% if r.archived %}
+                <div style="margin-top: .35rem">{{ unarchive_form(r, 'index') }}</div>
+              {% endif %}
+            </td>
+            <td class="hide-narrow small">
+              {% if r.checked_age %}
+                {{ r.checked_age }}
+                {% if r.stale %}<div class="badge warn">Stale</div>{% endif %}
+              {% else %}
+                <span class="muted">never</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td class="empty" colspan="3">
+            Nothing tracked yet &mdash; seed the list with
+            <code>python seed.py restaurants.txt</code>.
+          </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

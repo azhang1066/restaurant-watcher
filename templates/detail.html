@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% from "_status.html" import badges, unarchive_form %}
+
+{% block title %}{{ restaurant.name }} &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <p class="sub"><a href="{{ url_for('index') }}">&larr; All restaurants</a></p>
+
+  <h1>{{ restaurant.name }}</h1>
+  <p class="sub">
+    {{ badges(restaurant) }}
+    {% if restaurant.address %}<br>{{ restaurant.address }}{% endif %}
+    {% if restaurant.maps_url %}<br><a href="{{ restaurant.maps_url }}">View on Google Maps</a>{% endif %}
+  </p>
+
+  {% if restaurant.archived %}
+    <p class="sub">
+      {{ unarchive_form(restaurant, 'detail') }}
+      <span class="small muted">
+        Archived, so the weekly check skips it. Re-activating starts checking it again.
+      </span>
+    </p>
+  {% endif %}
+
+  <ul class="stats">
+    <li style="min-width: 10rem">
+      <b class="small">{{ restaurant.checked_age or 'never' }}</b>
+      <span>Last checked</span>
+    </li>
+    {% if restaurant.checked_at %}
+      <li style="min-width: 12rem">
+        <b class="small">{{ restaurant.checked_at.strftime('%Y-%m-%d %H:%M') }} UTC</b>
+        <span>Timestamp</span>
+      </li>
+    {% endif %}
+  </ul>
+
+  {% if restaurant.closing_soon_summary %}
+    <h2>Closing-soon signal</h2>
+    <div class="card" style="padding: .75rem">
+      <p class="summary-text" style="margin: 0">{{ restaurant.closing_soon_summary }}</p>
+      {% if not restaurant.closing_soon %}
+        <p class="muted small" style="margin: .5rem 0 0">
+          The flag is currently clear &mdash; this is the last summary recorded.
+        </p>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  <h2>Check history</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Month</th>
+          <th class="num">Checks</th>
+          <th class="num">Open</th>
+          <th class="num">Closed</th>
+          <th class="num">Closing soon</th>
+          <th class="hide-narrow">Last that month</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for month in history %}
+          <tr>
+            <td>{{ month.month }}</td>
+            <td class="num">{{ month.checks }}</td>
+            <td class="num">{{ month.operational_checks }}</td>
+            <td class="num">{{ month.closed_checks }}</td>
+            <td class="num">{{ month.closing_soon_checks }}</td>
+            <td class="hide-narrow small muted">{{ month.last_checked_at }}</td>
+          </tr>
+        {% else %}
+          <tr><td class="empty" colspan="6">No checks recorded yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="sub small" style="margin-top: .75rem">
+    Counts merge live <code>check_log</code> rows with the monthly rollups
+    older checks are folded into, so totals stay right after pruning.
+  </p>
+{% endblock %}

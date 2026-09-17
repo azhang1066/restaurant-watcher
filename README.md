@@ -54,6 +54,45 @@ For a real deployment, run `main.py` as a background service (systemd,
 Replit scheduled deployment, or a cron entry calling `--once`) rather than
 leaving a terminal open.
 
+## Dashboard
+
+A local page over whatever the checks have recorded:
+
+```bash
+flask --app app run     # http://127.0.0.1:5000
+python app.py           # same thing
+```
+
+The index lists every tracked restaurant -- closures and closing-soon
+signals sorted to the top -- with its status, last-checked age, and the
+summary behind any closing-soon flag. Clicking one opens its per-month
+check history (`db.check_history()`, which merges live `check_log` rows with
+the rollups older checks are folded into, so the totals survive pruning).
+Archived restaurants stay listed, greyed out, rather than disappearing.
+
+Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
+has quietly died otherwise looks just like a week with no bad news.
+
+### Re-activating an archived restaurant
+
+Permanent closures archive themselves, which is right when a place is gone
+and wrong when Google was mistaken or the place came back. Archived rows stay
+listed with a **Re-activate** button that puts them on the active list again.
+
+Only the archived flag changes -- the stored status and closing-soon flag are
+left as they were, so re-activating can't re-fire a closure alert that already
+went out. That does mean a place Google still reports as permanently closed
+gets archived again by the next check; the page says so when you click it.
+
+Forms carry a CSRF token tied to the session cookie, so set
+`DASHBOARD_SECRET_KEY` in `.env` if you want tokens to survive a restart.
+Without it a key is generated per process and an open page just needs a
+reload after the server restarts.
+
+It binds to localhost and has no auth or login, so don't expose it to a
+network. Adding restaurants is still `seed.py`, and checks still run from
+`main.py`.
+
 ## How checking works
 
 1. **Business status** (every run, cheap): Places API `businessStatus`

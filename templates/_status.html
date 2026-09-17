@@ -1,0 +1,27 @@
+{#- Status + closing-soon badges for one restaurant. Shared so the list and
+    detail pages can never disagree about what a row's state looks like. -#}
+{% macro badges(r) -%}
+  {% if r.status == 'OPERATIONAL' %}
+    <span class="badge ok">{{ r.status_label }}</span>
+  {% elif r.status == 'CLOSED_TEMPORARILY' %}
+    <span class="badge warn">{{ r.status_label }}</span>
+  {% else %}
+    <span class="badge bad">{{ r.status_label }}</span>
+  {% endif %}
+  {#- closing_soon_current, not the raw flag: the view drops the badge once a
+      place is shut for good (see _view). Still shown alongside a temporary
+      closure, where "and it's not coming back" is the whole point. -#}
+  {% if r.closing_soon_current %}<span class="badge warn">Closing soon</span>{% endif %}
+  {% if r.archived %}<span class="badge muted">Archived</span>{% endif %}
+{%- endmacro %}
+
+{#- Re-activate button for an archived restaurant. `return_to` is an endpoint
+    name the view allowlists, never a URL. -#}
+{% macro unarchive_form(r, return_to) -%}
+  <form class="inline" method="post"
+        action="{{ url_for('unarchive', restaurant_id=r.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="action" type="submit">Re-activate</button>
+  </form>
+{%- endmacro %}

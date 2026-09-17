@@ -88,6 +88,17 @@ def list_restaurants(active_only=True):
         return [dict(r) for r in conn.execute(q).fetchall()]
 
 
+def get_restaurant(restaurant_id):
+    """One restaurant by id, or None if there's no such row. Same dict shape
+    as list_restaurants(), archived or not -- the dashboard links to archived
+    rows too, and they're exactly the ones list_restaurants() hides."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM restaurants WHERE id = ?", (restaurant_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def update_check_result(restaurant_id, business_status, closing_soon_flag, closing_soon_summary, notes=""):
     with get_conn() as conn:
         conn.execute(
@@ -107,6 +118,29 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag, closi
 def archive_restaurant(restaurant_id):
     with get_conn() as conn:
         conn.execute("UPDATE restaurants SET archived = 1 WHERE id = ?", (restaurant_id,))
+
+
+def unarchive_restaurant(restaurant_id):
+    """Put an archived restaurant back on the active list. Returns True if a
+    row changed, False if there's no such restaurant.
+
+    Only `archived` is touched. `business_status` is left alone on purpose:
+    we don't know the place reopened, only that someone wants it watched
+    again, and writing an optimistic OPERATIONAL here would make the next
+    run read a status change and re-fire a closure alert already sent.
+
+    Note the interaction with main.run_check(), which archives on the status
+    itself rather than on the transition: if Places still reports
+    CLOSED_PERMANENTLY, the next run re-archives this row (quietly -- the
+    status hasn't changed, so nothing notifies). Un-archiving is for a place
+    that reopened or that Google had wrong, and it sticks once the next check
+    confirms that.
+    """
+    with get_conn() as conn:
+        changed = conn.execute(
+            "UPDATE restaurants SET archived = 0 WHERE id = ?", (restaurant_id,)
+        ).rowcount
+    return changed > 0
 
 
 def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
