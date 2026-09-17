@@ -4,11 +4,22 @@ announcement, local press coverage, etc. This is a judgment call, not a
 hard API field, so it's run less often than the Places status check
 (e.g. monthly, not weekly) to keep cost and noise down.
 """
-import os
 import json
 import anthropic
 
 MODEL = "claude-sonnet-4-6"
+
+# The SDK runs its own retry loop (exponential backoff, honors `retry-after`,
+# covers connection/timeout errors plus 408/409/429/5xx), so there is no
+# urllib3 Retry adapter to mount here the way places_client.py and notifier.py
+# do -- but its defaults are wrong for this caller. Two retries is one fewer
+# than everywhere else in the repo, and the 600s read timeout would stall the
+# serial per-restaurant loop for ten minutes on a single hung request. Both
+# are set explicitly below so the behaviour is visible rather than inherited.
+MAX_RETRIES = 3
+# Generous because a web_search turn does several searches server-side before
+# answering, but bounded: a news check is the optional half of a run.
+TIMEOUT_SECONDS = 120.0
 
 PROMPT_TEMPLATE = """Search for recent news (last 90 days) about whether the restaurant
 "{name}" at "{address}" is closing, has announced a closing date, or is otherwise
@@ -19,9 +30,17 @@ Respond with ONLY a JSON object, no other text, in this exact shape:
 """
 
 
+def _client():
+    """Built at call time, not import time, so `.env` lands however this module
+    was imported -- see `places_client._api_key()` for the same pattern. Reads
+    ANTHROPIC_API_KEY from the environment."""
+    return anthropic.Anthropic(max_retries=MAX_RETRIES, timeout=TIMEOUT_SECONDS)
+
+
 def check_closing_soon(name, address):
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-    resp = client.messages.create(
+    """Raises if the API is still failing once the SDK's retries are spent --
+    `main.run_check` decides what a dead news check means for the run."""
+    resp = _client().messages.create(
         model=MODEL,
         max_tokens=500,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],

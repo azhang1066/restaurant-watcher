@@ -34,9 +34,14 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),)):
 
     The run counter is a file in the real data/ directory, so leaving it
     unpatched would let a test run mutate the user's news-check cadence.
+    Cadence/retention env vars are cleared for the same reason: main reads
+    them at call time, so a developer's .env would otherwise steer the tests
+    that rely on the defaults.
     """
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    for var in ("CLOSING_SOON_CHECK_EVERY", "CHECK_LOG_RETAIN_DAYS"):
+        monkeypatch.delenv(var, raising=False)
     db.init_db()
     for name, place_id in restaurants:
         db.add_restaurant(name, place_id, address=f"{name} address")
@@ -59,12 +64,18 @@ def _patch_places(monkeypatch, by_place_id):
 
 
 def _patch_news(monkeypatch, by_name=None):
-    """Fake the Claude news check. Defaults to 'no closure signal'."""
+    """Fake the Claude news check. Defaults to 'no closure signal'. A value
+    may be a result dict or an Exception instance to raise, same convention
+    as _patch_places -- closure_checker lets failures through once the SDK's
+    retries are spent, so run_check has to handle one."""
     calls = []
 
     def _fake(name, address):
         calls.append((name, address))
-        return (by_name or {}).get(name, _news(False))
+        result = (by_name or {}).get(name, _news(False))
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     monkeypatch.setattr(main, "check_closing_soon", _fake)
     return calls
@@ -95,9 +106,9 @@ def test_news_check_runs_only_on_every_nth_run(tmp_path, monkeypatch):
     _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
     _patch_notifiers(monkeypatch)
     news = _patch_news(monkeypatch)
-    # Read into a module constant at import time (unlike notifier/places,
-    # which read env at call time), so patch the attribute, not the env var.
-    monkeypatch.setattr(main, "CLOSING_SOON_CHECK_EVERY", 3)
+    # Set after import on purpose: main reads the cadence at call time, the
+    # same way notifier/places_client read theirs.
+    monkeypatch.setenv("CLOSING_SOON_CHECK_EVERY", "3")
 
     main.run_check()  # run 1
     main.run_check()  # run 2
@@ -112,7 +123,7 @@ def test_include_news_check_overrides_the_counter(tmp_path, monkeypatch):
     _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
     _patch_notifiers(monkeypatch)
     news = _patch_news(monkeypatch)
-    monkeypatch.setattr(main, "CLOSING_SOON_CHECK_EVERY", 100)
+    monkeypatch.setenv("CLOSING_SOON_CHECK_EVERY", "100")
 
     main.run_check(include_news_check=True)
 
@@ -129,6 +140,67 @@ def test_news_check_skipped_for_non_operational_restaurants(tmp_path, monkeypatc
     main.run_check(include_news_check=True)
 
     assert news == []
+
+
+def test_failed_news_check_keeps_the_status_and_the_stored_flag(tmp_path, monkeypatch, caplog):
+    """A dead news check must not cost us the Places status we already paid
+    for, and must not clear a flag whose alert has already gone out -- that
+    would re-fire the alert on the next successful news check."""
+    caplog.set_level(logging.INFO)
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    closed, closing_soon = _patch_notifiers(monkeypatch)
+
+    # Run 1: a real closure signal, so the flag is set and alerted on.
+    _patch_news(monkeypatch, {"Lilia": _news(True, summary="Closing in March.")})
+    main.run_check(include_news_check=True)
+    assert len(closing_soon) == 1
+
+    # Run 2: the news check dies after its retries.
+    _patch_news(monkeypatch, {"Lilia": RuntimeError("Anthropic API is down")})
+    main.run_check(include_news_check=True)
+
+    row = _row("Lilia")
+    assert row["closing_soon_flag"] == 1
+    assert row["closing_soon_summary"] == "Closing in March."
+    assert row["business_status"] == "OPERATIONAL"
+    assert len(closing_soon) == 1  # not re-alerted
+    assert closed == []
+    # The status check still counts as a check: two runs, two logged checks.
+    # (Before the news check got its own try/except, run 2 was abandoned
+    # before update_check_result and this stayed at 1.)
+    assert db.check_history(row["id"])[0]["checks"] == 2
+
+
+def test_failed_news_check_is_not_counted_as_a_restaurant_failure(tmp_path, monkeypatch, caplog):
+    """The status check succeeded, so the restaurant isn't a failure -- but
+    the dead news check still has to be visible in the log."""
+    caplog.set_level(logging.INFO)
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch, {"Lilia": RuntimeError("Anthropic API is down")})
+
+    main.run_check(include_news_check=True)
+
+    assert "0/1 restaurants failed" in caplog.text
+    assert "Anthropic API is down" in caplog.text  # traceback, not just a count
+    assert "1 news check(s) failed" in caplog.text
+
+
+def test_failed_news_check_does_not_block_other_restaurants(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch,
+           restaurants=(("Lilia", "place-lilia"), ("Don Angie", "place-don-angie")))
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL",
+                                "place-don-angie": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    news = _patch_news(monkeypatch, {"Lilia": RuntimeError("Anthropic API is down"),
+                                     "Don Angie": _news(True, summary="Last service Sunday.")})
+
+    main.run_check(include_news_check=True)
+
+    assert len(news) == 2
+    assert _row("Don Angie")["closing_soon_flag"] == 1
 
 
 # --- notify on transition ----------------------------------------------
@@ -388,7 +460,7 @@ def _patch_prune(monkeypatch, retain_days, raises=None):
         return 0
 
     monkeypatch.setattr(main, "prune_check_log", _fake)
-    monkeypatch.setattr(main, "CHECK_LOG_RETAIN_DAYS", retain_days)
+    monkeypatch.setenv("CHECK_LOG_RETAIN_DAYS", str(retain_days))
     return calls
 
 

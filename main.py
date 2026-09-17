@@ -29,9 +29,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-CLOSING_SOON_CHECK_EVERY = int(os.environ.get("CLOSING_SOON_CHECK_EVERY", 4))  # every 4th run
-CHECK_LOG_RETAIN_DAYS = int(os.environ.get("CHECK_LOG_RETAIN_DAYS", 90))  # 0 disables pruning
+DEFAULT_CLOSING_SOON_CHECK_EVERY = 4
+DEFAULT_CHECK_LOG_RETAIN_DAYS = 90
+
 _run_count_file = os.path.join(os.path.dirname(__file__), "data", ".run_count")
+
+
+def _closing_soon_check_every():
+    """Read at call time, not import time, so `.env` lands however this module
+    was imported -- see `places_client._api_key()` for the same pattern."""
+    return int(os.environ.get("CLOSING_SOON_CHECK_EVERY") or DEFAULT_CLOSING_SOON_CHECK_EVERY)
+
+
+def _check_log_retain_days():
+    """Days of per-check detail to keep before folding into monthly rollups;
+    0 disables pruning. Read at call time for the same reason as above."""
+    return int(os.environ.get("CHECK_LOG_RETAIN_DAYS") or DEFAULT_CHECK_LOG_RETAIN_DAYS)
 
 
 def _next_run_count():
@@ -49,13 +62,13 @@ def run_check(include_news_check=None):
     init_db()
     run_count = _next_run_count()
     if include_news_check is None:
-        include_news_check = (run_count % CLOSING_SOON_CHECK_EVERY == 0)
+        include_news_check = (run_count % _closing_soon_check_every() == 0)
 
     restaurants = list_restaurants(active_only=True)
     logger.info("Checking %d restaurants (news check: %s)",
                 len(restaurants), "on" if include_news_check else "off")
 
-    failures = 0
+    failures = news_failures = 0
     for r in restaurants:
         try:
             status = get_business_status(r["place_id"])
@@ -66,9 +79,21 @@ def run_check(include_news_check=None):
             closing_soon = bool(r["closing_soon_flag"])
             summary = r.get("closing_soon_summary") or ""
             if include_news_check and status == "OPERATIONAL":
-                result = check_closing_soon(r["name"], r.get("address"))
-                closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
-                summary = result["summary"]
+                try:
+                    result = check_closing_soon(r["name"], r.get("address"))
+                except Exception:
+                    # The news check is the optional half of a check and the
+                    # SDK has already retried by the time we get here. Don't
+                    # throw away the Places status we just paid for: carry the
+                    # stored flag forward exactly as a plain run does (clearing
+                    # it would re-arm an alert already sent) and try again on
+                    # the next news cycle.
+                    news_failures += 1
+                    logger.exception("News check failed for %s (id=%s) -- keeping the stored "
+                                     "closing-soon flag", r["name"], r["id"])
+                else:
+                    closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
+                    summary = result["summary"]
 
             update_check_result(r["id"], status, closing_soon, summary)
 
@@ -89,17 +114,21 @@ def run_check(include_news_check=None):
             failures += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
 
-    if CHECK_LOG_RETAIN_DAYS > 0:
+    retain_days = _check_log_retain_days()
+    if retain_days > 0:
         try:
-            pruned = prune_check_log(CHECK_LOG_RETAIN_DAYS)
+            pruned = prune_check_log(retain_days)
             if pruned:
                 logger.info("Folded %d check_log rows older than %d days into monthly rollups.",
-                            pruned, CHECK_LOG_RETAIN_DAYS)
+                            pruned, retain_days)
         except Exception:
             # Housekeeping only -- never fail a run whose checks already landed.
             logger.exception("check_log pruning failed -- continuing")
 
     logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
+    if news_failures:
+        logger.warning("%d news check(s) failed; those restaurants kept their stored "
+                       "closing-soon flag.", news_failures)
 
 
 if __name__ == "__main__":

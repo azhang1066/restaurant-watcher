@@ -1,11 +1,12 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-17, against 5 commits through `c4f033d` ("Fixed environment
-variables pulling from different places") plus uncommitted work (`tests/test_main.py`
-and the two notification fixes it prompted) — 7 modules + 4 test files, ~1400 lines.
-This plan tracks open work only; finished items (HTTP retries, the test suite, email
-notifications, log pruning, call-time config, `run_check` coverage, the notify-on-
-transition fixes) are dropped once done — see git history for what landed._
+_Last reviewed: 2026-09-17, against 6 commits through `b55288a` ("Adding new tests")
+plus uncommitted work (`main.py`'s move to call-time config, `closure_checker.py`'s
+explicit retry/timeout config and the graceful degradation of a failed news check) —
+7 modules + 4 test files, ~1500 lines. This plan tracks open work only; finished items
+(HTTP retries everywhere including the Anthropic SDK, the test suite, email
+notifications, log pruning, call-time config, `run_check` coverage, the
+notify-on-transition fixes) are dropped once done — see git history for what landed._
 
 ## 1. Technical Overview
 
@@ -18,10 +19,10 @@ dependency, no web server exists yet (see Phase 2).
 
 | File | Role |
 |---|---|
-| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. |
+| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. Cadence/retention config is read per run via `_closing_soon_check_every()` / `_check_log_retain_days()`. |
 | `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()` and `check_history()`. |
 | `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (seed-time text search) and `get_business_status` (per-run cheap status poll). Retries via a `urllib3` `Retry` adapter. |
-| `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. |
+| `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. Retries/timeout are set explicitly on the SDK client rather than inherited. |
 | `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth) and, optionally, by email over SMTP. |
 | `seed.py` | One-time/occasional CLI: reads a text file of restaurant names, resolves each to a Google `place_id`, inserts into the DB. |
 
@@ -59,7 +60,10 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
      "news check" run (every `CLOSING_SOON_CHECK_EVERY`, default 4).
    - For every active (non-archived) restaurant: fetch `businessStatus` from Places.
    - If operational and it's a news-check run: ask Claude (with web search) whether
-     recent coverage suggests an impending closure.
+     recent coverage suggests an impending closure. A news check that fails after its
+     retries is logged and skipped, not fatal: the restaurant keeps the Places status
+     just fetched and carries its stored closing-soon flag forward, exactly as on a
+     plain run.
    - Write the result to `restaurants` (current state) and append a row to `check_log`
      (history/audit trail).
    - Compare new status to the previously stored status to decide whether to notify.
@@ -73,14 +77,14 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
 
 ### Test coverage
 `tests/` covers `db` (state transitions, pruning, rollups), `closure_checker` (JSON
-extraction from messy model output), `notifier` (call-time config, email fallbacks,
-failure isolation) and, as of 2026-09-17, `main.run_check` — news-check cadence,
-notify-on-transition, the closing-soon flag, per-restaurant failure isolation and
-housekeeping. `test_main.py` fakes the three external calls and runs against a real
-temp SQLite file, so the transitions it asserts are the same reads and writes
-production does — it caught two live notification bugs on the way in (both since
-fixed). 42 tests, all passing. `seed.py` and `places_client.py` remain uncovered
-(both are thin HTTP wrappers).
+extraction from messy model output, plus the client's retry/timeout config), `notifier`
+(call-time config, email fallbacks, failure isolation) and, as of 2026-09-17,
+`main.run_check` — news-check cadence, notify-on-transition, the closing-soon flag,
+per-restaurant failure isolation, news-check failure degradation and housekeeping.
+`test_main.py` fakes the three external calls and runs against a real temp SQLite file,
+so the transitions it asserts are the same reads and writes production does — it caught
+two live notification bugs on the way in (both since fixed). 48 tests, all passing.
+`seed.py` and `places_client.py` remain uncovered (both are thin HTTP wrappers).
 
 ### External API integrations
 - **Google Places API (New)** — the only restaurant-status source today. Two calls:
@@ -97,6 +101,15 @@ fixed). 42 tests, all passing. `seed.py` and `places_client.py` remain uncovered
   only for the low-frequency "closing soon" judgment call. Prompted for strict JSON;
   `closure_checker.py` defensively extracts the `{...}` substring since the model
   sometimes wraps it in prose.
+  - Retries are the SDK's own loop (exponential backoff, honors `retry-after`, covers
+    connection/timeout errors plus 408/409/429/5xx), so there is no `urllib3` adapter
+    to mount here — but `MAX_RETRIES = 3` and `TIMEOUT_SECONDS = 120` are set
+    explicitly on the client instead of inheriting the SDK defaults (2 retries and a
+    600s read timeout, which would stall the serial loop for ten minutes on one hung
+    request). `tests/test_closure_checker.py` pins both.
+  - Failures that survive the retries propagate out of `check_closing_soon()`; the
+    caller decides what they mean (see the data flow above), so a bad Anthropic day
+    costs the news signal, not the status check.
 
 ### Notification pipeline
 - `notifier.py` fans one `notify()` call out to two sinks:
@@ -121,16 +134,6 @@ fixed). 42 tests, all passing. `seed.py` and `places_client.py` remain uncovered
   log. `tests/test_main.py` is what pins all of this down.
 
 ### Gaps / risks worth knowing about
-- **`closure_checker.py` has no retry story of its own.** `places_client.py` and
-  `notifier.py` both mount a `urllib3` `Retry` adapter (3 retries, exponential backoff,
-  on 429/500/502/503/504), but `closure_checker.py` goes through the `anthropic` SDK
-  rather than raw `requests` and just inherits whatever the SDK's defaults are — worth
-  confirming if news checks start failing.
-- **`main.py` still reads config at import time.** `CLOSING_SOON_CHECK_EVERY` and
-  `CHECK_LOG_RETAIN_DAYS` are module-level constants, the exact pattern that `notifier.py`
-  and `places_client.py` were moved away from in `c4f033d` (their tests explain why).
-  It works today only because `load_dotenv()` runs above them in the same file; tests
-  have to patch the attribute rather than the env var.
 - `flask` dependency is unused — either build the dashboard it implies (Phase 2) or drop it.
 
 ## 3. Phased Work Plan
@@ -165,8 +168,9 @@ is a sibling concern:
   news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. Commit the pending work (`tests/test_main.py` + the two `main.py` notification
-   fixes) — the tree has been clean at every other checkpoint.
+1. Commit the pending work (`main.py`'s call-time config, `closure_checker.py`'s
+   explicit retry/timeout config, the failed-news-check degradation and their tests) —
+   the tree has been clean at every other checkpoint.
 2. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) —
    this is the biggest unknown and worth a short spike before committing to a design.
 3. Decide `flask`'s fate: build Phase 2's minimal dashboard, or drop the dependency.
