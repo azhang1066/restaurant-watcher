@@ -15,7 +15,7 @@ see Phase 1 status below._
 | File | Role |
 |---|---|
 | `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run. |
-| `db.py` | SQLite schema + CRUD. Two tables: `restaurants` (current state) and `check_log` (append-only history). |
+| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). |
 | `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (seed-time text search) and `get_business_status` (per-run cheap status poll). |
 | `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. |
 | `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth). |
@@ -35,6 +35,7 @@ flowchart TD
     main -->|"every Nth run"| closure["closure_checker.py"]
     closure -->|web_search tool call| anthropic[(Anthropic API)]
     main -->|update_check_result| db
+    main -->|prune_check_log: fold aged rows into rollups| db
     main -->|status changed?| notifier["notifier.py"]
     notifier -->|HTTP POST| ntfy[(ntfy.sh topic)]
     ntfy --> phone["Phone (ntfy app)"]
@@ -57,6 +58,8 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
    - Write the result to `restaurants` (current state) and append a row to `check_log`
      (history/audit trail).
    - Compare new status to the previously stored status to decide whether to notify.
+   - After the loop, `prune_check_log()` folds aged-out `check_log` rows into
+     `check_log_monthly` (housekeeping only -- a failure here is logged, not fatal).
 3. **Permanent closures auto-archive** the restaurant (`archived = 1`, excluded from
    future `list_restaurants(active_only=True)` calls). Temporary closures and
    closing-soon flags stay active so they keep surfacing on later runs.
@@ -119,7 +122,6 @@ is a sibling concern:
   concurrency (`concurrent.futures`) to the per-restaurant loop — currently fully serial.
 - Per-restaurant check cadence instead of one global schedule (e.g. check closing-soon
   news more often for restaurants already flagged once).
-- Prune/aggregate `check_log` over time so it doesn't grow unbounded.
 
 ## 4. Concrete Next Steps (start of next session)
 1. Decide Resy/OpenTable scope for Phase 2 (which platform first, what auth approach) —

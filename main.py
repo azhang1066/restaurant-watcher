@@ -4,6 +4,8 @@
 - Closing-soon news check (Claude + web search, costs more per call): only
   every Nth run, controlled by CLOSING_SOON_CHECK_EVERY, to keep this from
   burning tokens checking the same stable restaurants every day.
+- Housekeeping: after each run, aged-out check_log detail rows are folded
+  into monthly rollups (CHECK_LOG_RETAIN_DAYS, 0 to disable).
 
 Run once manually:  python main.py --once
 Run on a schedule:   python main.py           (blocks, checks weekly)
@@ -16,7 +18,8 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 
-from db import init_db, list_restaurants, update_check_result, archive_restaurant
+from db import (init_db, list_restaurants, update_check_result, archive_restaurant,
+                prune_check_log)
 from places_client import get_business_status
 from closure_checker import check_closing_soon
 from notifier import notify_closed, notify_closing_soon
@@ -27,6 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 CLOSING_SOON_CHECK_EVERY = int(os.environ.get("CLOSING_SOON_CHECK_EVERY", 4))  # every 4th run
+CHECK_LOG_RETAIN_DAYS = int(os.environ.get("CHECK_LOG_RETAIN_DAYS", 90))  # 0 disables pruning
 _run_count_file = os.path.join(os.path.dirname(__file__), "data", ".run_count")
 
 
@@ -74,6 +78,16 @@ def run_check(include_news_check=None):
         except Exception:
             failures += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
+
+    if CHECK_LOG_RETAIN_DAYS > 0:
+        try:
+            pruned = prune_check_log(CHECK_LOG_RETAIN_DAYS)
+            if pruned:
+                logger.info("Folded %d check_log rows older than %d days into monthly rollups.",
+                            pruned, CHECK_LOG_RETAIN_DAYS)
+        except Exception:
+            # Housekeeping only -- never fail a run whose checks already landed.
+            logger.exception("check_log pruning failed -- continuing")
 
     logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
 

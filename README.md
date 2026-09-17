@@ -66,6 +66,16 @@ Permanent closures auto-archive the restaurant after notifying; temporary
 closures and closing-soon flags stay active so you keep getting the
 context on future runs.
 
+## History retention
+
+Every check appends a row to `check_log`, so after each run rows older than
+`CHECK_LOG_RETAIN_DAYS` (default 90) are folded into per-month counts in
+`check_log_monthly` and deleted. Checks that *changed* something -- a
+`businessStatus` transition or the closing-soon flag flipping -- are kept as
+detail rows regardless of age, so the interesting history never gets summarized
+away. `db.check_history(restaurant_id)` reads the two tables back as one
+per-month view. Set `CHECK_LOG_RETAIN_DAYS=0` to keep everything.
+
 ## Cost notes
 
 - Places `businessStatus` stays in the cheap Essentials/Pro tier (~$5/1K
