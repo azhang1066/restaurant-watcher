@@ -7,11 +7,21 @@ file by hand. This serves:
     /restaurant/<id>             one restaurant, plus its per-month history
     /restaurant/<id>/unarchive   POST: put an archived restaurant back (see
                                  db.unarchive_restaurant for the caveat)
+    /add                         POST: search Google Places for a name
+    /add/confirm                 GET: show the match, POST: track it
 
 Every read goes through `db.py` rather than issuing its own SQL, so the
 numbers here can't drift from the values `main.py` decides notifications on.
-Un-archiving is the only write so far; the remaining manual actions (add a
-restaurant, force a check now) still need `seed.py`/`main.py` wired in.
+Of the manual actions, adding and un-archiving are wired up; "force a check
+now" still needs `main.py`'s loop split up before a request can drive it.
+
+Adding is the one thing here that spends money -- a Places Text Search per
+search -- and the one thing that can be silently *wrong*: Text Search always
+answers with its single best guess, so tracking the wrong "Lilia" looks
+exactly like tracking the right one. Hence the two steps: the search stashes
+its candidate and redirects, and a second, separate POST is what writes the
+row. The redirect in between also means a reload of the confirm page re-reads
+the stash rather than re-running (and re-paying for) the search.
 
 Because there is now a state-changing route, every form carries a CSRF token
 tied to the session -- see `_csrf_token()`. That needs a signing key, so set
@@ -38,8 +48,10 @@ from dotenv import load_dotenv
 from flask import (Flask, abort, flash, redirect, render_template, request,
                    session, url_for)
 
-from db import (check_history, get_restaurant, init_db, list_restaurants,
+from db import (add_restaurant, check_history, get_restaurant,
+                get_restaurant_by_place_id, init_db, list_restaurants,
                 unarchive_restaurant)
+from places_client import find_place_id, place_summary
 
 load_dotenv()
 
@@ -51,6 +63,11 @@ logger = logging.getLogger(__name__)
 STALE_AFTER_DAYS = 14
 
 _ATTENTION_STATUSES = ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY")
+
+# Cap what gets sent to Text Search. Long queries don't match better, and the
+# candidate rides back to the confirm page in the session cookie, which has
+# 4KB to work with.
+MAX_QUERY_CHARS = 120
 
 _STATUS_LABELS = {
     "OPERATIONAL": "Open",
@@ -128,6 +145,12 @@ def _age(then, now):
     return "just now"
 
 
+def _query_label(name, hint):
+    """What the user typed, for echoing back on the confirm page and in
+    'no match' messages -- the same string that was sent to Text Search."""
+    return f"{name} {hint}".strip() if hint else name
+
+
 def _view(restaurant, now):
     """Presentation-ready copy of a restaurant row.
 
@@ -148,7 +171,9 @@ def _view(restaurant, now):
         # A closing-soon flag is news about a *future* closure, so it stops
         # being news once the place is shut for good. Decided here rather than
         # in the template so the badge and the summary count can't disagree
-        # about what the page is showing.
+        # about what the page is showing. main.run_check() now settles the
+        # stored flag on a permanent closure too, so this is belt-and-braces
+        # -- it keeps the page honest about a row written by anything else.
         "closing_soon_current": closing_soon and status != "CLOSED_PERMANENTLY",
         "closing_soon_summary": restaurant.get("closing_soon_summary") or "",
         "archived": bool(restaurant["archived"]),
@@ -192,7 +217,8 @@ def create_app():
             "stale": sum(1 for v in active if v["stale"]),
         }
         return render_template("index.html", restaurants=views, summary=summary,
-                               stale_after_days=STALE_AFTER_DAYS)
+                               stale_after_days=STALE_AFTER_DAYS,
+                               max_query_chars=MAX_QUERY_CHARS)
 
     def _back_to(restaurant_id):
         """Send a POST back to the page it came from.
@@ -246,6 +272,116 @@ def create_app():
         else:
             flash(message, "info")
         return _back_to(restaurant_id)
+
+    # --- adding a restaurant ---------------------------------------------
+
+    @app.post("/add")
+    def add_search():
+        """Step 1: ask Places what this name resolves to.
+
+        POST-only and CSRF-checked because this is the one route that costs
+        money: a link, a prefetch or a crawler must not be able to spend a
+        Text Search call. Nothing is written here -- the candidate goes in
+        the session and the browser is redirected to the confirm page, so
+        reloading that page doesn't buy the same search twice.
+        """
+        _require_csrf()
+        name = (request.form.get("name") or "").strip()[:MAX_QUERY_CHARS]
+        hint = (request.form.get("address_hint") or "").strip()[:MAX_QUERY_CHARS]
+        if not name:
+            # Checked before the call, not after: an empty box is a slip, and
+            # it shouldn't cost a search to find that out.
+            flash("Enter a restaurant name to search for.", "warn")
+            return redirect(url_for("index"))
+
+        query = _query_label(name, hint)
+        try:
+            place = find_place_id(name, hint)
+        except Exception:
+            # Missing API key, a 4xx, a timeout after the adapter's retries.
+            # The traceback goes to the log; the page says what didn't happen.
+            logger.exception("Places text search failed for %r", query)
+            flash("Couldn't reach Google Places just now, so nothing was added. "
+                  "Try again in a minute.", "warn")
+            return redirect(url_for("index"))
+
+        if not place:
+            flash(f"No match on Google Places for “{query}”. "
+                  "Adding a city or street usually fixes it.", "warn")
+            return redirect(url_for("index"))
+
+        candidate = place_summary(place, fallback_name=name)
+        existing = get_restaurant_by_place_id(candidate["place_id"])
+        if existing is not None:
+            # Already known. add_restaurant() would quietly ignore the insert,
+            # which reads as "added" on a page that then shows one row -- so
+            # go to the row instead and say which one it is.
+            if existing["archived"]:
+                flash(f"Already tracking {existing['name']}, but it's archived -- "
+                      "re-activate it here.", "warn")
+            else:
+                flash(f"Already tracking {existing['name']}.", "info")
+            return redirect(url_for("detail", restaurant_id=existing["id"]))
+
+        session["pending_add"] = dict(candidate, query=query)
+        return redirect(url_for("add_confirm"))
+
+    @app.get("/add/confirm")
+    def add_confirm():
+        """Step 2: show the single best guess and make the user agree to it."""
+        candidate = session.get("pending_add")
+        if not candidate:
+            # No stash: a bookmarked URL, or a restart with a generated key
+            # that invalidated the session cookie.
+            flash("That search has expired -- run it again.", "warn")
+            return redirect(url_for("index"))
+        return render_template("confirm_add.html", candidate=candidate)
+
+    @app.post("/add/confirm")
+    def add_commit():
+        """Step 3: write the row. No API call here -- this only ever stores
+        the candidate the search already paid for."""
+        _require_csrf()
+        posted_place_id = request.form.get("place_id", "")
+
+        # Checked first because this is also the double-submit path: the first
+        # submit pops the stash, so by the second there's nothing left to tell
+        # "already added" from "expired". INSERT OR IGNORE makes the repeat
+        # harmless either way; reporting it as a fresh add would not be. The
+        # posted id is only ever read from here, never written, so a crafted
+        # one can do no more than name a row that's already on the page.
+        existing = get_restaurant_by_place_id(posted_place_id)
+        if existing is not None:
+            session.pop("pending_add", None)
+            flash(f"{existing['name']} was already being tracked.", "info")
+            return redirect(url_for("detail", restaurant_id=existing["id"]))
+
+        candidate = session.get("pending_add")
+        if not candidate:
+            flash("That search has expired -- run it again.", "warn")
+            return redirect(url_for("index"))
+
+        # The form posts back the place_id alone, and it has to match the
+        # candidate the server actually looked up. The row is then built from
+        # the session copy, so a doctored form can't show one restaurant on
+        # the page and file a different one in the database.
+        if posted_place_id != candidate["place_id"]:
+            abort(400, "That confirmation doesn't match the search it came from.")
+
+        add_restaurant(name=candidate["name"], place_id=candidate["place_id"],
+                       address=candidate["address"], maps_url=candidate["maps_url"])
+        session.pop("pending_add", None)
+
+        added = get_restaurant_by_place_id(candidate["place_id"])
+        if added is None:  # pragma: no cover -- the insert just succeeded
+            logger.error("Added %r but couldn't read it back", candidate["place_id"])
+            flash("Something went wrong adding that -- check the log.", "warn")
+            return redirect(url_for("index"))
+
+        logger.info("Added %s (place_id=%s) from the dashboard",
+                    added["name"], added["place_id"])
+        flash(f"Now tracking {added['name']}. The next check will pick it up.", "info")
+        return redirect(url_for("detail", restaurant_id=added["id"]))
 
     return app
 

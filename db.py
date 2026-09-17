@@ -69,6 +69,16 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Settle any closing-soon flag left set on a permanently closed row.
+        # main.run_check() clears the flag as the closure lands, but rows
+        # written before it did that are unreachable by it: a permanent
+        # closure archives, and archived rows are never checked again. Cheap
+        # and idempotent, so it just runs every time rather than needing a
+        # migration to track.
+        conn.execute(
+            """UPDATE restaurants SET closing_soon_flag = 0
+               WHERE business_status = 'CLOSED_PERMANENTLY' AND closing_soon_flag = 1"""
+        )
 
 
 def add_restaurant(name, place_id, address=None, maps_url=None):
@@ -95,6 +105,21 @@ def get_restaurant(restaurant_id):
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM restaurants WHERE id = ?", (restaurant_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_restaurant_by_place_id(place_id):
+    """One restaurant by its Google place_id, or None. Same dict shape as
+    get_restaurant(), archived rows included.
+
+    place_id is what add_restaurant() dedupes on, so this is the only way to
+    tell "already tracking this place" from "new" -- the INSERT OR IGNORE
+    itself reports neither.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM restaurants WHERE place_id = ?", (place_id,)
         ).fetchone()
     return dict(row) if row else None
 

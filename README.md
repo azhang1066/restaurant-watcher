@@ -73,6 +73,31 @@ Archived restaurants stay listed, greyed out, rather than disappearing.
 Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
 has quietly died otherwise looks just like a week with no bad news.
 
+### Adding a restaurant
+
+The search box at the top of the index takes a name and, optionally, a city
+or street. It resolves the name through Google Places Text Search and shows
+you the single match it found -- name, address and a Maps link -- and nothing
+is tracked until you press **Track this restaurant** on that page.
+
+The confirm step is not ceremony. Text Search always answers with its one
+best guess and no confidence alongside it, so a mistyped or ambiguous name
+comes back as a real restaurant somewhere else, and a wrong one being watched
+looks exactly like a right one. The address is what tells them apart.
+
+This is also the only button here that spends money -- one Text Search call
+per search, the same call `seed.py` makes per line -- so the search is a POST
+that a link or a prefetch can't trigger, and confirming (or reloading the
+confirm page) costs nothing further. The Flask process needs
+`GOOGLE_PLACES_API_KEY` in its environment for this; without it the page says
+so instead of failing silently.
+
+Searching for something already tracked takes you to its row rather than
+adding a duplicate -- including when it's archived, which is how you'd
+rediscover that a place reopened.
+
+`seed.py` is still the way to add a list in bulk.
+
 ### Re-activating an archived restaurant
 
 Permanent closures archive themselves, which is right when a place is gone
@@ -90,8 +115,8 @@ Without it a key is generated per process and an open page just needs a
 reload after the server restarts.
 
 It binds to localhost and has no auth or login, so don't expose it to a
-network. Adding restaurants is still `seed.py`, and checks still run from
-`main.py`.
+network -- more so now that buttons on it add rows and spend API calls.
+Checks themselves still run from `main.py`.
 
 ## How checking works
 

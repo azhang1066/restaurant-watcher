@@ -95,6 +95,16 @@ def run_check(include_news_check=None):
                     closing_soon = result["closing_soon"] and result["confidence"] in ("medium", "high")
                     summary = result["summary"]
 
+            # A closing-soon flag is a prediction about a *future* closure,
+            # so the closure landing settles it rather than confirming it.
+            # Clear it here or nothing ever will: permanent closures archive
+            # on this same run, and the news check that owns the flag only
+            # runs on OPERATIONAL places. The summary is kept as the record
+            # of what was predicted. Temporary closures keep their flag --
+            # there, "and it's not coming back" is still an open question.
+            if status == "CLOSED_PERMANENTLY":
+                closing_soon = False
+
             update_check_result(r["id"], status, closing_soon, summary)
 
             # Notify on any move *into* a closed status, not just from

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Confirm a match &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Is this the right place?</h1>
+  <p class="sub">Google's best match for &ldquo;{{ candidate.query }}&rdquo;. Text Search
+    always answers with exactly one guess, right or wrong &mdash; and a wrong one looks
+    identical to a right one once it's being watched. Check the address.</p>
+
+  <div class="card" style="padding: .9rem">
+    <p class="name" style="margin: 0 0 .15rem">{{ candidate.name }}</p>
+    {% if candidate.address %}
+      <p class="muted small" style="margin: 0">{{ candidate.address }}</p>
+    {% endif %}
+    {% if candidate.maps_url %}
+      <p class="small" style="margin: .5rem 0 0">
+        <a href="{{ candidate.maps_url }}" target="_blank" rel="noopener noreferrer">
+          Open on Google Maps</a> to be sure
+      </p>
+    {% endif %}
+  </div>
+
+  <form method="post" action="{{ url_for('add_commit') }}" style="margin-top: 1rem">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {#- The place_id is posted back only so the server can check this form is
+        the one it handed out; the row itself is built from the session copy. -#}
+    <input type="hidden" name="place_id" value="{{ candidate.place_id }}">
+    <button class="action" type="submit">Track this restaurant</button>
+    <a class="small" style="margin-left: .6rem" href="{{ url_for('index') }}">Cancel</a>
+  </form>
+
+  <p class="sub small" style="margin-top: 1rem">Not it? Cancel and search again with a
+    street or neighborhood &mdash; that's what narrows it down.</p>
+{% endblock %}

@@ -14,7 +14,7 @@ Where restaurants.txt has one restaurant per line, e.g.:
 """
 import sys
 from db import init_db, add_restaurant
-from places_client import find_place_id
+from places_client import find_place_id, place_summary
 
 
 def seed_from_file(path):
@@ -31,14 +31,9 @@ def seed_from_file(path):
         if not place:
             print(f"  ✗ no match found for: {line}")
             continue
-        display_name = place.get("displayName", {}).get("text", name.strip())
-        add_restaurant(
-            name=display_name,
-            place_id=place["id"],
-            address=place.get("formattedAddress"),
-            maps_url=place.get("googleMapsUri"),
-        )
-        print(f"  ✓ added: {display_name}")
+        fields = place_summary(place, fallback_name=name.strip())
+        add_restaurant(**fields)
+        print(f"  ✓ added: {fields['name']}")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,22 @@ def find_place_id(name, address_hint=""):
     return places[0] if places else None
 
 
+def place_summary(place, fallback_name=""):
+    """Flatten a Text Search result into the fields db.add_restaurant() takes.
+
+    Shared by seed.py and the dashboard's add flow so the two can't disagree
+    about what gets stored -- `displayName` is Google's canonical name for
+    the place ("Lilia" for a query of "lilia brooklyn"), with the text the
+    caller searched for as the fallback if the field is missing.
+    """
+    return {
+        "name": (place.get("displayName") or {}).get("text") or fallback_name,
+        "place_id": place["id"],
+        "address": place.get("formattedAddress"),
+        "maps_url": place.get("googleMapsUri"),
+    }
+
+
 def get_business_status(place_id):
     """Cheap status check: id + businessStatus + displayName only."""
     url = f"{PLACES_BASE}/places/{place_id}"

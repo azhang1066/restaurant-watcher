@@ -71,6 +71,16 @@
     }
     button.action:hover { border-color: var(--accent); color: var(--accent); }
     form.inline { display: inline; margin: 0; }
+    form.add {
+      display: flex; flex-wrap: wrap; gap: .5rem; align-items: center;
+      padding: .75rem; margin: 0 0 1.5rem;
+    }
+    input.text {
+      font: inherit; font-size: .875rem; color: var(--text); background: var(--bg);
+      border: 1px solid var(--line); border-radius: 6px; padding: .35rem .55rem;
+      flex: 1 1 12rem; min-width: 0;
+    }
+    input.text:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .name { font-weight: 600; }
     .summary-text { margin: .2rem 0 0; max-width: 34rem; }
     @media (max-width: 40rem) {

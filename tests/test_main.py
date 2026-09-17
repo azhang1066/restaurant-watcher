@@ -390,6 +390,74 @@ def test_news_check_can_clear_a_previously_set_closing_soon_flag(tmp_path, monke
     assert len(closing_soon) == 2
 
 
+def test_permanent_closure_clears_the_closing_soon_flag(tmp_path, monkeypatch):
+    """The flag predicts a closure, so the closure itself has to settle it.
+    Nothing else can: the row archives on this same run, and the news check
+    that owns the flag only runs on OPERATIONAL places -- so a flag left set
+    here freezes forever and the stored column stops meaning "is this place
+    closing". The summary stays as the record of what was predicted."""
+    _setup(tmp_path, monkeypatch)
+    statuses = {"place-lilia": "OPERATIONAL"}
+    _patch_places(monkeypatch, statuses)
+    closed, closing_soon = _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch, {"Lilia": _news(True, "high", "Closing after 10 years")})
+
+    main.run_check(include_news_check=True)
+    assert _row("Lilia")["closing_soon_flag"] == 1  # the prediction
+
+    statuses["place-lilia"] = "CLOSED_PERMANENTLY"
+    main.run_check(include_news_check=True)  # it came true
+
+    row = _row("Lilia")
+    assert row["closing_soon_flag"] == 0
+    assert row["closing_soon_summary"] == "Closing after 10 years"
+    assert row["archived"] == 1
+    # The closure itself is the news; clearing the flag must not turn into a
+    # second alert, or read as a retraction.
+    assert closed == [("Lilia", "CLOSED_PERMANENTLY")]
+    assert len(closing_soon) == 1
+
+
+def test_temporary_closure_keeps_the_closing_soon_flag(tmp_path, monkeypatch):
+    """Only a *permanent* closure settles the prediction. A temporarily
+    closed place that was reported closing for good is exactly the row the
+    flag is still saying something about."""
+    _setup(tmp_path, monkeypatch)
+    statuses = {"place-lilia": "OPERATIONAL"}
+    _patch_places(monkeypatch, statuses)
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch, {"Lilia": _news(True, "high", "Closing after 10 years")})
+
+    main.run_check(include_news_check=True)
+    statuses["place-lilia"] = "CLOSED_TEMPORARILY"
+    main.run_check(include_news_check=True)
+
+    assert _row("Lilia")["closing_soon_flag"] == 1
+
+
+def test_reopened_restaurant_can_be_flagged_closing_soon_again(tmp_path, monkeypatch):
+    """Clearing on closure re-arms the alert, which is the right outcome: a
+    place that came back and is reported closing again is new news, not the
+    old story repeating."""
+    _setup(tmp_path, monkeypatch)
+    statuses = {"place-lilia": "OPERATIONAL"}
+    _patch_places(monkeypatch, statuses)
+    _, closing_soon = _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch, {"Lilia": _news(True, "high", "Closing after 10 years")})
+
+    main.run_check(include_news_check=True)
+    statuses["place-lilia"] = "CLOSED_PERMANENTLY"
+    main.run_check(include_news_check=True)
+
+    # Google had it wrong; the owner puts it back on the list.
+    db.unarchive_restaurant(_row("Lilia")["id"])
+    statuses["place-lilia"] = "OPERATIONAL"
+    main.run_check(include_news_check=True)
+
+    assert _row("Lilia")["closing_soon_flag"] == 1
+    assert len(closing_soon) == 2
+
+
 # --- per-restaurant failure isolation -----------------------------------
 
 def test_one_failing_restaurant_does_not_stop_the_others(tmp_path, monkeypatch):

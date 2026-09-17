@@ -64,6 +64,42 @@ def test_archive_restaurant_excludes_from_active_list(tmp_path, monkeypatch):
     assert all_restaurants[0]["archived"] == 1
 
 
+def test_init_db_settles_a_stale_closing_soon_flag_on_a_closed_row(tmp_path, monkeypatch):
+    """main.run_check() clears the flag as a permanent closure lands, but it
+    can't reach rows written before it did: those archive on the run that
+    closed them and are never checked again. init_db() sweeps them so the
+    column means the same thing everywhere it's read."""
+    _fresh_db(tmp_path, monkeypatch)
+    db.add_restaurant("Lilia", "place123")
+    restaurant_id = db.list_restaurants()[0]["id"]
+    db.update_check_result(restaurant_id, "CLOSED_PERMANENTLY", True, "Closing after 10 years")
+    db.archive_restaurant(restaurant_id)
+
+    db.init_db()
+
+    r = db.get_restaurant(restaurant_id)
+    assert r["closing_soon_flag"] == 0
+    # Only the flag is settled -- the summary is the record of what was
+    # predicted, and the row stays archived.
+    assert r["closing_soon_summary"] == "Closing after 10 years"
+    assert r["archived"] == 1
+
+
+def test_init_db_leaves_an_open_closing_soon_flag_alone(tmp_path, monkeypatch):
+    """The sweep is about closures that already landed. A place still open,
+    or temporarily closed, has a flag that's still saying something."""
+    _fresh_db(tmp_path, monkeypatch)
+    for name, place_id, status in (("Lilia", "place123", "OPERATIONAL"),
+                                   ("Don Angie", "place456", "CLOSED_TEMPORARILY")):
+        db.add_restaurant(name, place_id)
+        row = next(r for r in db.list_restaurants() if r["name"] == name)
+        db.update_check_result(row["id"], status, True, "Closing after 10 years")
+
+    db.init_db()
+
+    assert all(r["closing_soon_flag"] == 1 for r in db.list_restaurants())
+
+
 def _log_check(restaurant_id, checked_at, business_status="OPERATIONAL", closing_soon_flag=0):
     """Append a check_log row at an explicit timestamp -- update_check_result
     always stamps CURRENT_TIMESTAMP, so aging rows has to be done directly."""

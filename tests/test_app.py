@@ -5,10 +5,15 @@ timestamps stored as naive UTC being read as local time, the closing-soon
 flag and status rendering out of step with what main.py notified on, or
 archived rows vanishing from a page that exists to show them.
 
-Un-archiving is the one write, and it gets the scrutiny a state change
-deserves: that it flips only `archived`, that it is rejected without a valid
-CSRF token, that GET cannot trigger it, and that it is honest about a
-permanently-closed row the next run will re-archive.
+Un-archiving and adding are the writes, and they get the scrutiny a state
+change deserves: that un-archiving flips only `archived`, that neither runs
+without a valid CSRF token, that GET cannot trigger either, and that they're
+honest about a row that was already there.
+
+Adding gets a second kind of scrutiny, because the Places Text Search it runs
+costs money and returns exactly one best guess. Several tests below assert
+the search did *not* happen -- on an empty box, on a rejected token, on a GET
+-- and that nothing is tracked until the separate confirm POST.
 
 Same setup as the other tests: a real temp SQLite file via db.DB_PATH, so
 the rows these pages render are written and read exactly as in production.
@@ -34,10 +39,10 @@ def _csrf(client):
     """Put a known CSRF token in the session and hand it back.
 
     The app mints tokens lazily, when a template actually renders a form, so
-    there is nothing to read back on a page with no archived rows. Seeding
-    the session keeps these tests about the POST behaviour rather than the
-    markup; test_unarchive_accepts_a_token_from_a_rendered_page covers the
-    real round trip through a page.
+    what a page hands back depends on what was on it. Seeding the session
+    keeps these tests about the POST behaviour rather than the markup;
+    test_unarchive_accepts_a_token_from_a_rendered_page covers the real round
+    trip through a page.
     """
     with client.session_transaction() as sess:
         sess["csrf_token"] = "test-csrf-token"
@@ -63,6 +68,49 @@ def _add(name, place_id, **checks):
             checks.get("summary", ""),
         )
     return restaurant_id
+
+
+_UNSET = object()
+
+
+def _place(place_id="place-lilia", name="Lilia",
+           address="567 Union Ave, Brooklyn, NY", maps_url="https://maps.example/lilia"):
+    """A Places Text Search hit, in the shape find_place_id() returns one."""
+    return {"id": place_id, "displayName": {"text": name},
+            "formattedAddress": address, "googleMapsUri": maps_url}
+
+
+def _patch_search(monkeypatch, result=_UNSET):
+    """Fake the Text Search. `result` is a place dict, None for "no match",
+    or an Exception to raise.
+
+    The returned call list is half the point: this call costs money, so
+    several tests below are about it *not* happening.
+    """
+    calls = []
+
+    def _fake(name, address_hint=""):
+        calls.append((name, address_hint))
+        if isinstance(result, Exception):
+            raise result
+        return _place() if result is _UNSET else result
+
+    monkeypatch.setattr(dashboard, "find_place_id", _fake)
+    return calls
+
+
+def _post_add(client, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post("/add", data=data, follow_redirects=follow_redirects)
+
+
+def _post_confirm(client, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post("/add/confirm", data=data, follow_redirects=follow_redirects)
+
+
+def _tracked():
+    return db.list_restaurants(active_only=False)
 
 
 def _text(response):
@@ -357,6 +405,221 @@ def test_unarchive_accepts_a_token_from_a_rendered_page(client):
 
     assert response.status_code == 302
     assert db.get_restaurant(restaurant_id)["archived"] == 0
+
+
+# --- adding a restaurant --------------------------------------------------
+
+def test_add_search_confirms_before_tracking_anything(client, monkeypatch):
+    """The search spends money; it must not also spend a row. Text Search
+    returns one best guess and no confidence with it, so the guess gets shown
+    and agreed to before anything is watched."""
+    calls = _patch_search(monkeypatch)
+
+    response = _post_add(client, name="Lilia", address_hint="Brooklyn")
+
+    assert calls == [("Lilia", "Brooklyn")]
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/add/confirm")
+    assert _tracked() == []  # searched, not added
+
+    body = _text(client.get("/add/confirm"))
+    assert "Lilia" in body
+    assert "567 Union Ave, Brooklyn, NY" in body
+    assert "https://maps.example/lilia" in body
+
+
+def test_confirm_tracks_the_restaurant(client, monkeypatch):
+    _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    response = _post_confirm(client, place_id="place-lilia")
+
+    rows = _tracked()
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Lilia"
+    assert rows[0]["address"] == "567 Union Ave, Brooklyn, NY"
+    assert rows[0]["maps_url"] == "https://maps.example/lilia"
+    assert rows[0]["business_status"] == "OPERATIONAL"
+    assert rows[0]["last_checked_at"] is None  # nothing has checked it yet
+    assert response.headers["Location"].endswith("/restaurant/%d" % rows[0]["id"])
+
+
+def test_confirm_stores_googles_name_not_the_typed_one(client, monkeypatch):
+    """Same rule seed.py follows -- the stored name is Google's canonical one,
+    so the page and the notifications don't end up saying "lilia bklyn"."""
+    _patch_search(monkeypatch)
+    _post_add(client, name="lilia bklyn")
+
+    _post_confirm(client, place_id="place-lilia")
+
+    assert _tracked()[0]["name"] == "Lilia"
+
+
+def test_confirm_page_reload_does_not_pay_for_another_search(client, monkeypatch):
+    """Why the search redirects instead of rendering the result itself: a
+    reload of a POSTed page re-runs the POST, and this POST has a bill."""
+    calls = _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    _text(client.get("/add/confirm"))
+    _text(client.get("/add/confirm"))
+
+    assert len(calls) == 1
+
+
+def test_add_search_without_a_name_does_not_call_places(client, monkeypatch):
+    """An empty box is a slip; finding that out shouldn't cost a search."""
+    calls = _patch_search(monkeypatch)
+
+    body = _text(_post_add(client, name="   ", follow_redirects=True))
+
+    assert calls == []
+    assert "Enter a restaurant name" in body
+    assert _tracked() == []
+
+
+def test_add_search_reports_no_match(client, monkeypatch):
+    _patch_search(monkeypatch, result=None)
+
+    body = _text(_post_add(client, name="Not A Real Place", follow_redirects=True))
+
+    assert "No match" in body
+    assert _tracked() == []
+
+
+def test_add_search_survives_a_places_failure(client, monkeypatch):
+    """A missing API key or a dead Places API is a message, not a 500 -- the
+    dashboard is where someone would find out the key was never set."""
+    _patch_search(monkeypatch, result=RuntimeError("Set GOOGLE_PLACES_API_KEY"))
+
+    body = _text(_post_add(client, name="Lilia", follow_redirects=True))
+
+    assert "reach Google Places" in body  # apostrophe is HTML-escaped in the flash
+    assert _tracked() == []
+
+
+def test_add_search_of_a_tracked_place_goes_to_the_existing_row(client, monkeypatch):
+    """add_restaurant() dedupes on place_id by quietly ignoring the insert,
+    which would read as "added" on a page that then shows a single row. Say
+    which row it is instead."""
+    existing_id = _add("Lilia", "place-lilia")
+    _patch_search(monkeypatch)
+
+    response = _post_add(client, name="Lilia")
+
+    assert response.headers["Location"].endswith("/restaurant/%d" % existing_id)
+    assert "Already tracking Lilia" in _text(client.get("/restaurant/%d" % existing_id))
+    assert len(_tracked()) == 1
+
+
+def test_add_search_of_an_archived_place_says_it_is_archived(client, monkeypatch):
+    """Searching for something you'd given up on is how you would rediscover
+    that it reopened -- and the row it lands on has the Re-activate button."""
+    existing_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
+    db.archive_restaurant(existing_id)
+    _patch_search(monkeypatch)
+
+    body = _text(_post_add(client, name="Lilia", follow_redirects=True))
+
+    assert "archived" in body
+    assert "Re-activate" in body
+    assert len(_tracked()) == 1
+
+
+def test_add_search_rejects_missing_csrf_token(client, monkeypatch):
+    """No token, no search -- the rejection has to land before the money."""
+    calls = _patch_search(monkeypatch)
+
+    response = client.post("/add", data={"name": "Lilia"})
+
+    assert response.status_code == 400
+    assert calls == []
+    assert _tracked() == []
+
+
+def test_add_search_rejects_wrong_csrf_token(client, monkeypatch):
+    calls = _patch_search(monkeypatch)
+
+    response = _post_add(client, token="not-the-token", name="Lilia")
+
+    assert response.status_code == 400
+    assert calls == []
+
+
+def test_add_search_rejects_get(client, monkeypatch):
+    """A paid call behind a GET is one prefetch or crawler away from running
+    on its own, repeatedly."""
+    calls = _patch_search(monkeypatch)
+
+    assert client.get("/add?name=Lilia").status_code == 405
+    assert calls == []
+
+
+def test_confirm_rejects_missing_csrf_token(client, monkeypatch):
+    _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    response = client.post("/add/confirm", data={"place_id": "place-lilia"})
+
+    assert response.status_code == 400
+    assert _tracked() == []
+
+
+def test_confirm_page_shows_without_committing(client, monkeypatch):
+    """GET /add/confirm renders the candidate; only the POST may commit it."""
+    _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    _text(client.get("/add/confirm"))
+
+    assert _tracked() == []
+
+
+def test_confirm_without_a_pending_search_expires(client):
+    """A bookmarked URL, or a restart that invalidated the session cookie."""
+    body = _text(_post_confirm(client, place_id="place-lilia", follow_redirects=True))
+
+    assert "expired" in body
+    assert _tracked() == []
+
+
+def test_confirm_page_without_a_pending_search_expires(client):
+    body = _text(client.get("/add/confirm", follow_redirects=True))
+
+    assert "expired" in body
+
+
+def test_confirm_rejects_a_place_id_the_search_did_not_return(client, monkeypatch):
+    """The row is built from the session copy, so a doctored form can't put
+    one restaurant on the page and file a different one -- but it shouldn't
+    quietly track the shown one either. Refuse the mismatch."""
+    _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    response = _post_confirm(client, place_id="place-somewhere-else")
+
+    assert response.status_code == 400
+    assert _tracked() == []
+
+
+def test_confirm_twice_does_not_duplicate_or_claim_a_second_add(client, monkeypatch):
+    _patch_search(monkeypatch)
+    _post_add(client, name="Lilia")
+
+    _post_confirm(client, place_id="place-lilia")
+    body = _text(_post_confirm(client, place_id="place-lilia", follow_redirects=True))
+
+    assert len(_tracked()) == 1
+    assert "already being tracked" in body
+
+
+def test_index_offers_the_search_form(client):
+    body = _text(client.get("/"))
+
+    assert 'action="/add"' in body
+    assert 'name="address_hint"' in body
+    # The page has to say what the button costs before it gets pressed.
+    assert "one paid search per click" in body
 
 
 def test_closing_soon_stat_matches_the_badges_on_screen(client):

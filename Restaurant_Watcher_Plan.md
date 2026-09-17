@@ -1,14 +1,16 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-17, against 7 commits through `dbb0a83` ("Closing gaps")
-plus uncommitted work (the dashboard: `app.py`, `templates/`, `db.get_restaurant()`,
-`db.unarchive_restaurant()`, `tests/test_app.py`). Measured at that point: 7 modules
-(930 lines), 4 templates (270), 5 test files (1330) — the tests are now the largest
-part of the repo. This plan tracks open work only; finished items (HTTP retries
-everywhere including the Anthropic SDK, the test suite, email notifications, log
-pruning, call-time config, `run_check` coverage, the notify-on-transition fixes,
-Phase 2's read-only view and its re-activate action) are dropped once done — see git
-history for what landed._
+_Last reviewed: 2026-09-17, against 8 commits through `eec6758` ("Updating dashboard
+with unarchiving") plus uncommitted work: the closing-soon flag being settled on a
+permanent closure (`main.py`, `db.init_db()`), and the dashboard's add-a-restaurant
+flow (`app.py`, `templates/confirm_add.html`, `places_client.place_summary()`,
+`db.get_restaurant_by_place_id()`, `tests/test_places_client.py`). Measured at that
+point: 7 modules (1110 lines), 5 templates (330), 6 test files (1750) — the tests are
+comfortably the largest part of the repo. This plan tracks open work only; finished
+items (HTTP retries everywhere including the Anthropic SDK, the test suite, email
+notifications, log pruning, call-time config, `run_check` coverage, the
+notify-on-transition fixes, and Phase 2's read-only view, re-activate action and
+add-a-restaurant flow) are dropped once done — see git history for what landed._
 
 ## 1. Technical Overview
 
@@ -23,13 +25,13 @@ dashboard's templates):
 | File | Role |
 |---|---|
 | `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. Cadence/retention config is read per run via `_closing_soon_check_every()` / `_check_log_retain_days()`. |
-| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()`, `check_history()`, `get_restaurant()` and `unarchive_restaurant()` (the inverse of `archive_restaurant()`; touches only `archived`). |
-| `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (seed-time text search) and `get_business_status` (per-run cheap status poll). Retries via a `urllib3` `Retry` adapter. |
+| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()`, `check_history()`, `get_restaurant()`, `get_restaurant_by_place_id()` (the add flow's "already tracking this?" check — `add_restaurant()` dedupes by quietly ignoring the insert, so nothing else can tell) and `unarchive_restaurant()` (the inverse of `archive_restaurant()`; touches only `archived`). `init_db()` also settles any `closing_soon_flag` left set on a permanently closed row. |
+| `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (text search, at seed time and behind the dashboard's add form) and `get_business_status` (per-run cheap status poll). `place_summary()` flattens a search hit into the columns `add_restaurant()` takes, shared by `seed.py` and `app.py` so the two can't disagree about what gets stored. Retries via a `urllib3` `Retry` adapter. |
 | `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. Retries/timeout are set explicitly on the SDK client rather than inherited. |
 | `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth) and, optionally, by email over SMTP. |
 | `seed.py` | One-time/occasional CLI: reads a text file of restaurant names, resolves each to a Google `place_id`, inserts into the DB. |
-| `app.py` | Flask dashboard. `/` lists every restaurant with status/last-checked age, `/restaurant/<id>` adds the per-month history, and `POST /restaurant/<id>/unarchive` re-activates an archived one. Reads and writes only through `db.py`; no module-level `app`, so importing it has no side effects (Flask's loader finds `create_app()`). Forms carry a session CSRF token (`DASHBOARD_SECRET_KEY`, generated per process if unset). |
-| `templates/` | `base.html` (layout, light/dark tokens, flash messages), `index.html`, `detail.html`, and `_status.html` — macros for the status badges and the re-activate form, shared so the two pages can't disagree about what a state looks like. Presentation decisions that a count on the page also depends on live in `app._view()`, not in the templates. |
+| `app.py` | Flask dashboard. `/` lists every restaurant with status/last-checked age plus the add-a-restaurant search box, `/restaurant/<id>` adds the per-month history, `POST /restaurant/<id>/unarchive` re-activates an archived one, and `POST /add` → `GET,POST /add/confirm` is the two-step add (see the data flow below). Reads and writes through `db.py`; the only external call it makes is that one Text Search. No module-level `app`, so importing it has no side effects (Flask's loader finds `create_app()`). Forms carry a session CSRF token (`DASHBOARD_SECRET_KEY`, generated per process if unset). |
+| `templates/` | `base.html` (layout, light/dark tokens, flash messages), `index.html`, `detail.html`, `confirm_add.html` (the "is this the right place?" step), and `_status.html` — macros for the status badges and the re-activate form, shared so the two pages can't disagree about what a state looks like. Presentation decisions that a count on the page also depends on live in `app._view()`, not in the templates. |
 
 **How they fit together:**
 
@@ -52,7 +54,8 @@ flowchart TD
     ntfy --> phone["Phone (ntfy app)"]
 
     dash["app.py (Flask)"] -->|"list_restaurants / get_restaurant / check_history"| db
-    dash -->|"unarchive_restaurant (POST + CSRF)"| db
+    dash -->|"unarchive_restaurant / add_restaurant (POST + CSRF)"| db
+    dash -->|"add: find_place_id (confirmed before it's stored)"| places
     browser["Browser (localhost:5000)"] --> dash
 ```
 
@@ -62,8 +65,10 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
 ## 2. Current Architecture
 
 ### Data flow
-1. **Seed once:** `seed.py` reads `restaurants.txt` → `find_place_id()` resolves each line
-   to a Google Place ID via Text Search → row inserted into `restaurants`.
+1. **Getting restaurants in:** `seed.py` reads `restaurants.txt` → `find_place_id()`
+   resolves each line to a Google Place ID via Text Search → row inserted into
+   `restaurants`. The dashboard does the same thing one at a time, with a confirm
+   step in between (step 5).
 2. **Each scheduled run** (`main.run_check`):
    - Increments a persistent run counter (`data/.run_count`) to decide if this is a
      "news check" run (every `CLOSING_SOON_CHECK_EVERY`, default 4).
@@ -81,21 +86,40 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
    - After the loop, `prune_check_log()` folds aged-out `check_log` rows into
      `check_log_monthly` (housekeeping only -- a failure here is logged, not fatal).
 3. **Permanent closures auto-archive** the restaurant (`archived = 1`, excluded from
-   future `list_restaurants(active_only=True)` calls). Temporary closures and
+   future `list_restaurants(active_only=True)` calls) and clear `closing_soon_flag`:
+   the flag predicts a future closure, so the closure landing settles it, and this
+   is the last run that can — the row is archived from here on and the news check
+   that owns the flag only runs on `OPERATIONAL` places. `closing_soon_summary` is
+   kept as the record of what was predicted. Temporary closures and their
    closing-soon flags stay active so they keep surfacing on later runs.
+   `db.init_db()` sweeps the same invariant over rows written before this existed,
+   which are unreachable from `run_check` for exactly the reason above.
 4. **Un-archiving is manual** and only from the dashboard, for a place that reopened
    or that Google had wrong. It flips `archived` and nothing else, so it can't
    re-fire a closure alert — but because step 3 keys off the status rather than the
    transition, a row whose stored status is still `CLOSED_PERMANENTLY` gets archived
    again by the next run (silently, since nothing changed). The dashboard warns about
    exactly that case when it happens.
+5. **Adding from the dashboard is two steps**, because Text Search always answers with
+   exactly one best guess and no confidence beside it — a wrong "Lilia" being watched
+   looks identical to a right one. `POST /add` spends the search, stashes the candidate
+   in the session and redirects; `GET /add/confirm` shows name, address and Maps link;
+   `POST /add/confirm` writes the row from the **session** copy, with the posted
+   `place_id` used only to check the form matches the search it came from. Three
+   consequences worth keeping: the redirect means reloading the confirm page doesn't
+   re-buy the search; a name already tracked skips the confirm and redirects to its
+   existing row (`get_restaurant_by_place_id()`), archived ones included, since
+   `add_restaurant()`'s `INSERT OR IGNORE` would otherwise read as a successful add;
+   and a search that fails or matches nothing is a flash message, never a 500 — this
+   page is where an unset `GOOGLE_PLACES_API_KEY` surfaces.
 
 ### Test coverage
 `tests/` covers `db` (state transitions, pruning, rollups), `closure_checker` (JSON
 extraction from messy model output, plus the client's retry/timeout config), `notifier`
 (call-time config, email fallbacks, failure isolation) and, as of 2026-09-17,
 `main.run_check` — news-check cadence, notify-on-transition, the closing-soon flag,
-per-restaurant failure isolation, news-check failure degradation and housekeeping —
+per-restaurant failure isolation, news-check failure degradation, the flag being
+settled by a permanent closure (but not a temporary one) and housekeeping —
 and `app` (rendering, sort order, summary counts, archived rows staying visible,
 UTC timestamp handling, staleness) — plus the un-archive POST: that it changes only
 `archived`, is rejected without a valid CSRF token, is unreachable by GET, warns on a
@@ -107,9 +131,21 @@ the summary matches the badges actually on screen.
 `test_main.py` fakes the three external calls and runs against a real temp SQLite file,
 so the transitions it asserts are the same reads and writes production does — it caught
 two live notification bugs on the way in (both since fixed). `test_app.py` uses the same
-real-DB-in-tmp_path setup through Flask's test client. 77 tests, all passing
-(`app` 29, `main` 24, `db` 10, `closure_checker` 8, `notifier` 6).
-`seed.py` and `places_client.py` remain uncovered (both are thin HTTP wrappers).
+real-DB-in-tmp_path setup through Flask's test client.
+
+The add flow is tested for a second thing besides correctness: that the paid call
+*doesn't* happen. An empty box, a rejected CSRF token and a GET each assert
+`find_place_id` was never called, and reloading the confirm page asserts the search ran
+once. The rest cover the failure modes that have a wrong-but-plausible alternative —
+a place already tracked (redirect to its row, no duplicate), a double-submitted confirm
+(reports "already tracked", not a second add), a confirm whose `place_id` doesn't match
+the search (400, nothing stored), an expired session, no match, and a dead Places API.
+`tests/test_places_client.py` is new and covers only `place_summary()`, the pure
+name/address mapping both callers share.
+
+105 tests, all passing (`app` 48, `main` 27, `db` 12, `closure_checker` 8, `notifier` 6,
+`places_client` 4). `seed.py` and the HTTP halves of `places_client.py` remain
+uncovered — faking `requests` there would only assert the mock.
 
 ### External API integrations
 - **Google Places API (New)** — the only restaurant-status source today. Two calls:
@@ -126,15 +162,18 @@ real-DB-in-tmp_path setup through Flask's test client. 77 tests, all passing
   - **Email (optional)** — SMTP with STARTTLS, active only when `SMTP_HOST`, `EMAIL_FROM` (or `SMTP_USER`) and `EMAIL_TO` are all set; `_email_settings()` returns `None` otherwise and the send is skipped. Failures are caught and logged, so a broken mail server never breaks the ntfy alert or the run.
 - Two notification types:
   - `notify_closed` (high priority) — fires on any change *into* `CLOSED_TEMPORARILY`/`CLOSED_PERMANENTLY`, including temporary → permanent, which is a distinct event worth hearing about.
-  - `notify_closing_soon` (default priority) — fires when `closing_soon_flag` goes 0 → 1. Only a news check can move that flag; plain runs carry the stored value forward, so the alert is sent once per closure story rather than once per news cycle. A later news check finding no signal clears the flag and re-arms the alert.
+  - `notify_closing_soon` (default priority) — fires when `closing_soon_flag` goes 0 → 1. Only a news check can move that flag; plain runs carry the stored value forward, so the alert is sent once per closure story rather than once per news cycle. A later news check finding no signal clears the flag and re-arms the alert, as does the
+    permanent closure that ends the story — so a place that turns out to be open after all
+    and is later reported closing again is heard about a second time.
 - Archiving keys off the status (`CLOSED_PERMANENTLY`), not the transition, so a row stranded active by a failed run still leaves the active list on the next one. Same mechanism re-archives a manually un-archived row whose status hasn't changed — see data flow step 4.
 - No dedup/backoff beyond these state-transition checks in `main.py`; no notification log. `tests/test_main.py` is what pins all of this down.
 
 ### Gaps / risks worth knowing about
-- The dashboard has no auth and binds to localhost only. Fine as-is; it becomes a real decision the moment anyone wants it reachable from a phone, which is also the point where the personal restaurant list stops being local-only data.
+- The dashboard has no auth and binds to localhost only. Fine as-is; it becomes a real decision the moment anyone wants it reachable from a phone, which is also the point where the personal restaurant list stops being local-only data. The add form raises the stakes slightly: a page that spends money per click is worse to expose than one that only reads.
+- The add flow has no rate limit — nothing stops a held-down Enter key from running one Text Search per submit. Acceptable for one user pressing a button on localhost, and the first thing to revisit if this is ever exposed or scripted.
 - It's served by Flask's development server. Fine for a personal tool on localhost; a real deployment needs a WSGI server in front.
 - CSRF tokens live in a session cookie signed with `DASHBOARD_SECRET_KEY`. Unset, a per-process key is generated and open pages stop working after a restart (a reload fixes it). That's the right trade for one user on localhost and the wrong one the moment the app is served to anything else.
-- `closing_soon_flag` outlives the closure it predicted. The news check only runs on `OPERATIONAL` restaurants, so once a place is closed the flag freezes at whatever it last was and nothing ever clears it. Harmless today — `notify_closing_soon` only fires on 0 → 1, and the dashboard drops the badge once a place is permanently closed (`_view()`'s `closing_soon_current`) — but it means the stored flag is not a trustworthy "is this place closing" answer on its own, which is worth knowing before anything else reads it.
+- `closing_soon_flag` on a *temporarily* closed place is the one state the flag can still sit in indefinitely: the news check only runs on `OPERATIONAL` rows, so a place that closes temporarily while flagged keeps the flag until it reopens and a news check revisits it. That's deliberate (a place shut "temporarily" that was reported closing for good is exactly what the flag is for), but it means the flag reflects the last news check, not the present, for as long as that lasts. Permanent closures no longer have this problem — see the data flow above.
 
 ## 3. Phased Work Plan
 
@@ -146,26 +185,26 @@ This is the natural "new feature," and matches what `notifier.py`'s docstring im
 - New notification type via the existing `notifier.py` (`notify_table_available`).
 
 ### Phase 2 — Dashboard: remaining manual actions
-The read-only view and the re-activate action have landed, so `flask` is no longer a
-dead dependency and the CSRF plumbing every remaining form needs is in place
-(`_csrf_token()` / `_require_csrf()` in `app.py`). Still open:
-- **Add a restaurant** from the page instead of editing `restaurants.txt` — wraps
-  `find_place_id()` + `add_restaurant()`. Needs a confirm step: Text Search returns a
-  best guess, and silently tracking the wrong "Lilia" is the failure mode. This is
-  also the first action that spends money (a Text Search call) on a button press.
+The read-only view, the re-activate action and adding a restaurant have all landed, so
+the dashboard is now the place the tool is driven from rather than a viewer — the only
+routine reason left to touch a terminal is running the checks. One action is still open:
 - **Force a check now** — runs `run_check()` for one restaurant. `run_check` currently
   only does all-or-nothing over the active list and owns the run counter, so a
   single-restaurant path means either a parameter or a narrower extracted helper.
-  Doing this from a request thread also makes a page hang on Places/Anthropic latency.
+  Doing this from a request thread also makes a page hang on Places/Anthropic latency
+  — the add flow doesn't have this problem (one Text Search returns in well under a
+  second), but a news check behind the same button would, so this needs its design
+  decision made before it's built.
 - Auth is still undecided, and is the blocker for serving this anywhere but localhost
-  now that buttons on the page change state.
+  now that buttons on the page change state and spend money.
 
 ### Phase 3 — Efficiency / scale polish (once restaurant count grows)
 - Batch Places status checks if/when Google's API supports it, or at least add concurrency (`concurrent.futures`) to the per-restaurant loop — currently fully serial.
 - Per-restaurant check cadence instead of one global schedule (e.g. check closing-soon news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. Commit the dashboard (`app.py`, `templates/`, `db.get_restaurant()`, `db.unarchive_restaurant()`, `tests/test_app.py`, README + `.env.example`) — the tree has been clean at every other checkpoint.
-2. Seed the DB and look at the page against real data. `data/` is still empty, so the dashboard has only ever been rendered against fixtures and a scratch DB — the column widths and the usefulness of the history table are unvalidated at ~100 rows.
-3. Decide whether the two remaining manual actions are wanted before Phase 1, since they're what turns the dashboard from a viewer into the place the tool is driven from. "Force a check now" is the one that needs a design decision first (it can't run inline in a request thread without hanging the page).
-4. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
+1. Commit the closing-soon fix and the add flow (`main.py`, `db.py`, `app.py`, `places_client.py`, `seed.py`, `templates/`, `tests/`, README + `.env.example`) — the tree has been clean at every other checkpoint.
+2. Use the add form against the real Places API with a real key. Every test fakes `find_place_id`, so the response *shape* (`displayName.text`, `formattedAddress`, `googleMapsUri` all present on a real hit) is assumed, not verified — and a deliberately ambiguous query is the way to see whether the confirm page actually gives you enough to catch a wrong match.
+3. Seed the DB and look at the page against real data. `data/` is still empty, so the dashboard has only ever been rendered against fixtures and a scratch DB — the column widths and the usefulness of the history table are unvalidated at ~100 rows.
+4. Decide whether "force a check now" is wanted before Phase 1, and if so how it avoids hanging a request thread (background thread, a job row the scheduler picks up, or restricting the button to the cheap Places half).
+5. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.

@@ -19,6 +19,23 @@
       {{ stale_after_days }}+ days &mdash; is the scheduler still running?</p>
   {% endif %}
 
+  {#- The one form on this site that costs money, so it says so, and it
+      searches rather than adds -- the confirm page is where tracking starts. -#}
+  <form class="add card" method="post" action="{{ url_for('add_search') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input class="text" type="text" name="name" required
+           maxlength="{{ max_query_chars }}"
+           placeholder="Restaurant name" aria-label="Restaurant name">
+    <input class="text" type="text" name="address_hint"
+           maxlength="{{ max_query_chars }}"
+           placeholder="City or street (optional)" aria-label="City or street">
+    <button class="action" type="submit">Search</button>
+    <p class="muted small" style="width: 100%; margin: 0">
+      Looks the name up on Google Places &mdash; one paid search per click.
+      You'll confirm the match before anything gets tracked.
+    </p>
+  </form>
+
   <div class="card">
     <table>
       <thead>
@@ -55,8 +72,8 @@
           </tr>
         {% else %}
           <tr><td class="empty" colspan="3">
-            Nothing tracked yet &mdash; seed the list with
-            <code>python seed.py restaurants.txt</code>.
+            Nothing tracked yet &mdash; search for one above, or seed a whole list
+            with <code>python seed.py restaurants.txt</code>.
           </td></tr>
         {% endfor %}
       </tbody>
