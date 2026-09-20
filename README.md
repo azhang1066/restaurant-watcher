@@ -77,6 +77,27 @@ Archived restaurants stay listed, greyed out, rather than disappearing.
 Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
 has quietly died otherwise looks just like a week with no bad news.
 
+### Checking a restaurant now
+
+Next to Delete, every row a scheduled run would check carries a **Check now**
+button: it re-polls Google for that one restaurant immediately, writes the
+result, logs it, and sends the same alerts and archives on the same rule the
+weekly run does.
+
+It runs the *cheap* half of a check only. A full check also asks Claude
+whether there is closure news about the place, and that call is allowed 120
+seconds before it gives up -- too long to hold a page open, and it spends
+real credits per press. So **Check now** never moves the closing-soon flag;
+whatever the last news check concluded is carried forward untouched, and the
+next news check happens on the weekly schedule as usual. Pressing the button
+does not shift that schedule either: the run counter that decides when the
+next news check falls due is left alone, so checking one restaurant cannot
+delay the news check for the rest.
+
+The button is only offered where a scheduled run would act: not on an
+unverified restaurant (that gate exists so nothing is spent on a row nobody
+has confirmed) and not on an archived one (re-activate it first).
+
 ### Removing a restaurant
 
 Each row in the table ends with a **Delete** button: the restaurant stops

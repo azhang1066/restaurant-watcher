@@ -25,6 +25,7 @@ import pytest
 
 import app as dashboard
 import db
+import main
 
 
 @pytest.fixture
@@ -761,6 +762,22 @@ def test_reject_reopens_the_search_with_the_name_filled_in(client):
     assert "Lilia address" not in body
 
 
+def test_reject_flash_renders_its_em_dash(client):
+    """The message spent a while reading "Removed Lilia. Search again with a
+    street or city \\u2014 that's what narrows it down." on screen: the escape
+    was doubled in the source, so Python stored the six characters instead of
+    the dash. Nothing asserted on this string, which is exactly why it
+    survived -- the other reject tests check the redirect and the row, not the
+    words. Asserting the backslash is *absent* is the part that catches a
+    re-doubling; the dash alone would pass either way on a sloppy match."""
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    body = _text(_post_reject(client, restaurant_id, follow_redirects=True))
+
+    assert "street or city — that" in body
+    assert "u2014" not in body
+
+
 def test_reject_requires_a_csrf_token(client):
     restaurant_id = _add("Lilia", "place-lilia", verified=False)
 
@@ -954,3 +971,303 @@ def test_delete_button_round_trips_a_token_from_the_rendered_page(client):
     client.post(f"/restaurant/{restaurant_id}/delete", data={"csrf_token": token})
 
     assert db.get_restaurant(restaurant_id) is None
+
+
+# --- checking a restaurant now -------------------------------------------
+#
+# The button runs main.check_one, the same function the weekly run calls, so
+# these tests are mostly about the two things the route adds around it: that
+# it is offered and honoured for exactly the rows a scheduled run would check,
+# and that it stays on the cheap half. Several assert the news check didn't
+# happen -- that call is allowed 120 seconds and costs real credits, and a
+# request thread is the wrong place for both.
+
+
+def _post_check(client, restaurant_id, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post(f"/restaurant/{restaurant_id}/check", data=data,
+                       follow_redirects=follow_redirects)
+
+
+def _patch_check(monkeypatch, status="OPERATIONAL"):
+    """Fake everything check_one reaches for, and record it.
+
+    Patched on `main`, not on `app`: the dashboard imports check_one, and that
+    function resolves these names in main's globals. Patching the wrong module
+    would leave the real Places call in place, which is the failure mode worth
+    being explicit about.
+
+    `status` is the businessStatus to answer with, or an Exception to raise.
+    Returns (places_calls, news_calls, notifications) -- the news list is the
+    one most of these tests assert is empty.
+    """
+    places, news, notifications = [], [], []
+
+    def _fake_status(place_id):
+        places.append(place_id)
+        if isinstance(status, Exception):
+            raise status
+        return status
+
+    def _fake_news(name, address=None):
+        # Recorded rather than raised: check_one catches whatever a news check
+        # throws, so an AssertionError in here would be swallowed and the test
+        # would pass while the call was happening.
+        news.append(name)
+        return {"closing_soon": True, "confidence": "high", "summary": "from the news"}
+
+    monkeypatch.setattr(main, "get_business_status", _fake_status)
+    monkeypatch.setattr(main, "check_closing_soon", _fake_news)
+    monkeypatch.setattr(main, "notify_closed",
+                        lambda r, s: notifications.append(("closed", r["name"], s)))
+    monkeypatch.setattr(main, "notify_closing_soon",
+                        lambda r, summary: notifications.append(("soon", r["name"])))
+    return places, news, notifications
+
+
+def test_check_now_polls_places_and_stores_the_result(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    places, news, _ = _patch_check(monkeypatch, "CLOSED_TEMPORARILY")
+
+    response = _post_check(client, restaurant_id)
+
+    assert response.status_code == 302
+    assert places == ["place-lilia"]
+    assert news == []
+    assert db.get_restaurant(restaurant_id)["business_status"] == "CLOSED_TEMPORARILY"
+
+
+def test_check_now_appends_to_the_history(client, monkeypatch):
+    """A manual check is a check: it belongs in the log the detail page reads,
+    not off to one side, or the history would quietly disagree with the row."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    _patch_check(monkeypatch)
+
+    _post_check(client, restaurant_id)
+
+    assert len(db.check_history(restaurant_id)) == 1
+
+
+def test_check_now_never_runs_the_news_check(client, monkeypatch):
+    """The whole scoping decision, in one assertion."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    _, news, _ = _patch_check(monkeypatch)
+
+    _post_check(client, restaurant_id)
+
+    assert news == []
+
+
+def test_check_now_carries_the_closing_soon_flag_forward(client, monkeypatch):
+    """Only a news check can move that flag, and this isn't one. Clearing it
+    here would re-arm an alert that has already been sent, so the next weekly
+    news check would report the same closure story a second time."""
+    restaurant_id = _add("Lilia", "place-lilia", closing_soon=True,
+                         summary="Reported closing in March")
+    _patch_check(monkeypatch)
+
+    _post_check(client, restaurant_id)
+
+    row = db.get_restaurant(restaurant_id)
+    assert row["closing_soon_flag"] == 1
+    assert row["closing_soon_summary"] == "Reported closing in March"
+
+
+def test_check_now_notifies_on_a_move_into_closed(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    _, _, notifications = _patch_check(monkeypatch, "CLOSED_PERMANENTLY")
+
+    _post_check(client, restaurant_id)
+
+    assert notifications == [("closed", "Lilia", "CLOSED_PERMANENTLY")]
+
+
+def test_check_now_does_not_re_notify_when_nothing_changed(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_TEMPORARILY")
+    _, _, notifications = _patch_check(monkeypatch, "CLOSED_TEMPORARILY")
+
+    _post_check(client, restaurant_id)
+
+    assert notifications == []
+
+
+def test_check_now_archives_a_permanent_closure_and_says_so(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    _patch_check(monkeypatch, "CLOSED_PERMANENTLY")
+
+    body = _text(_post_check(client, restaurant_id, follow_redirects=True))
+
+    assert db.get_restaurant(restaurant_id)["archived"] == 1
+    assert "been archived" in body
+
+
+def test_check_now_settles_the_flag_on_a_permanent_closure(client, monkeypatch):
+    """Same rule as a scheduled run: the closure landing settles the
+    prediction, and this is the last check that can -- the row archives here,
+    and the news check that owns the flag only runs on OPERATIONAL places."""
+    restaurant_id = _add("Lilia", "place-lilia", closing_soon=True, summary="Reported")
+    _patch_check(monkeypatch, "CLOSED_PERMANENTLY")
+
+    _post_check(client, restaurant_id)
+
+    row = db.get_restaurant(restaurant_id)
+    assert row["closing_soon_flag"] == 0
+    assert row["closing_soon_summary"] == "Reported"
+
+
+def test_check_now_reports_no_change_plainly(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
+    _patch_check(monkeypatch, "OPERATIONAL")
+
+    body = _text(_post_check(client, restaurant_id, follow_redirects=True))
+
+    assert "still Open" in body
+
+
+def test_check_now_reports_a_reopening(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_TEMPORARILY")
+    _patch_check(monkeypatch, "OPERATIONAL")
+
+    body = _text(_post_check(client, restaurant_id, follow_redirects=True))
+
+    assert "is Open again" in body
+
+
+def test_check_now_leaves_the_run_counter_alone(client, monkeypatch):
+    """The counter decides when the next news check falls due for the whole
+    list. A button on one restaurant must not move that schedule for the
+    other fifty."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    _patch_check(monkeypatch)
+    counted = []
+    monkeypatch.setattr(main, "_next_run_count", lambda: counted.append(1) or 1)
+
+    _post_check(client, restaurant_id)
+
+    assert counted == []
+
+
+def test_check_now_survives_a_dead_places_api(client, monkeypatch):
+    """Nothing is written before the fetch returns, so there is no
+    half-applied check to explain -- the row should read exactly as it did."""
+    restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
+    before = db.check_history(restaurant_id)
+    _patch_check(monkeypatch, RuntimeError("places is down"))
+
+    body = _text(_post_check(client, restaurant_id, follow_redirects=True))
+
+    assert "Couldn" in body and "reach Google Places" in body
+    assert db.get_restaurant(restaurant_id)["business_status"] == "OPERATIONAL"
+    # Not "empty" -- the fixture's own check wrote a row. Nothing was *added*.
+    assert db.check_history(restaurant_id) == before
+
+
+def test_check_now_requires_a_csrf_token(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    places, _, _ = _patch_check(monkeypatch)
+
+    response = _post_check(client, restaurant_id, token="wrong")
+
+    assert response.status_code == 400
+    assert places == []
+
+
+def test_check_now_is_unreachable_by_get(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    places, _, _ = _patch_check(monkeypatch)
+
+    assert client.get(f"/restaurant/{restaurant_id}/check").status_code == 405
+    assert places == []
+
+
+def test_check_now_refuses_an_unverified_restaurant(client, monkeypatch):
+    """run_check skips these entirely, on purpose -- nothing is spent on a row
+    nobody has confirmed points at the right place. The button would be a way
+    around that gate, so the route closes it."""
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    places, _, _ = _patch_check(monkeypatch)
+
+    response = _post_check(client, restaurant_id)
+
+    assert response.status_code == 400
+    assert places == []
+
+
+def test_check_now_refuses_an_archived_restaurant(client, monkeypatch):
+    """Re-activating is how you resume checking one. Checking it in place
+    would only archive it again on the same status."""
+    restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
+    db.archive_restaurant(restaurant_id)
+    places, _, _ = _patch_check(monkeypatch)
+
+    response = _post_check(client, restaurant_id)
+
+    assert response.status_code == 400
+    assert places == []
+
+
+def test_check_now_on_a_missing_restaurant_is_404(client, monkeypatch):
+    places, _, _ = _patch_check(monkeypatch)
+
+    assert _post_check(client, 9999).status_code == 404
+    assert places == []
+
+
+def test_check_button_is_offered_only_where_the_post_would_be_honoured(client):
+    """The template reads `checkable` and the route reads `_is_checkable` --
+    one rule, so the page cannot show a button that answers 400."""
+    active = _add("Lilia", "place-lilia")
+    unverified = _add("Unsure", "place-unsure", verified=False)
+    archived = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
+    db.archive_restaurant(archived)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert f"/restaurant/{active}/check" in body
+    assert f"/restaurant/{unverified}/check" not in body
+    assert f"/restaurant/{archived}/check" not in body
+
+
+def test_check_button_says_it_skips_the_news_check(client):
+    """Check now, sitting next to a Closing soon badge, otherwise reads as a
+    promise to go and re-read the news."""
+    _add("Lilia", "place-lilia")
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "closing-soon news check" in body
+
+
+def test_check_now_returns_to_the_page_it_was_pressed_on(client, monkeypatch):
+    restaurant_id = _add("Lilia", "place-lilia")
+    _patch_check(monkeypatch)
+
+    from_index = _post_check(client, restaurant_id, return_to="index")
+    from_detail = _post_check(client, restaurant_id)
+
+    assert from_index.headers["Location"] == "/"
+    assert from_detail.headers["Location"] == f"/restaurant/{restaurant_id}"
+
+
+def test_check_now_cannot_be_steered_off_site(client, monkeypatch):
+    """`return_to` names an endpoint, never a URL."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    _patch_check(monkeypatch)
+
+    response = _post_check(client, restaurant_id, return_to="https://evil.example/")
+
+    assert response.headers["Location"] == f"/restaurant/{restaurant_id}"
+
+
+def test_check_button_round_trips_a_token_from_the_rendered_page(client, monkeypatch):
+    """The POSTs above seed the session, so nothing else here would notice the
+    form and the check disagreeing about the field name."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    places, _, _ = _patch_check(monkeypatch)
+    body = client.get("/").get_data(as_text=True)
+    form = body.split(f"/restaurant/{restaurant_id}/check")[1]
+    token = re.search(r'name="csrf_token" value="([^"]+)"', form).group(1)
+
+    client.post(f"/restaurant/{restaurant_id}/check", data={"csrf_token": token})
+
+    assert places == ["place-lilia"]

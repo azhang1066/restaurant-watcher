@@ -9,6 +9,7 @@ file by hand. This serves:
                                  db.unarchive_restaurant for the caveat)
     /restaurant/<id>/verify      POST: confirm this is the right place
     /restaurant/<id>/reject      POST: it wasn't -- delete it and search again
+    /restaurant/<id>/check       POST: re-poll Places for this one, now
     /restaurant/<id>/delete      POST: stop watching it -- delete row + history
     /add                         POST: search Google Places for a name
     /add/confirm                 GET: show the match, POST: track it
@@ -34,6 +35,11 @@ already verified -- that page is the yes -- so this only ever asks about
 places nobody has actually looked at. Saying no deletes the row outright
 rather than archiving it, because its history describes a different
 restaurant; the search box is re-opened with the name filled in.
+
+Checking now is the one action that spends anything, so it is scoped to the
+cheap half: it re-polls Google Places for a single restaurant and leaves the
+Claude news check on the weekly schedule, where a 120-second timeout is
+nobody's problem. See check_now().
 
 Deleting is the same removal offered for its own sake, from the list itself:
 somewhere you simply don't want watched any more. It's the only destructive
@@ -71,6 +77,11 @@ from db import (add_restaurant, check_history, delete_restaurant,
                 get_restaurant, get_restaurant_by_place_id, init_db,
                 list_restaurants, unarchive_restaurant, verify_restaurant)
 from places_client import find_place_id, place_summary
+# The dashboard runs the same check the scheduler does rather than a second
+# implementation of it -- see main.check_one. main has no import-time work
+# beyond load_dotenv() and a logging.basicConfig() that no-ops once handlers
+# exist, and it imports nothing from here, so there's no cycle and no app.
+from main import check_one
 
 load_dotenv()
 
@@ -170,6 +181,18 @@ def _query_label(name, hint):
     return f"{name} {hint}".strip() if hint else name
 
 
+def _is_checkable(restaurant):
+    """Whether a scheduled run would check this row: verified and not
+    archived, exactly what main.run_check's split selects.
+
+    One definition with two callers -- _view() decides whether to offer the
+    Check-now button, check_now() decides whether to honour the POST. Spelled
+    out twice they would eventually disagree, and the way that shows up is a
+    button on the page that answers 400.
+    """
+    return bool(restaurant.get("verified_at")) and not restaurant["archived"]
+
+
 def _view(restaurant, now):
     """Presentation-ready copy of a restaurant row.
 
@@ -208,6 +231,9 @@ def _view(restaurant, now):
         # has ever looked up -- and now indefinitely, since an unverified one
         # is never checked at all.
         "status_known": checked_at is not None,
+        # Whether to offer the Check-now button. Decided here, not in the
+        # template, so it and the route's guard read the same rule.
+        "checkable": _is_checkable(restaurant),
         "checked_at": checked_at,
         "checked_age": _age(checked_at, now),
         # Never checked is its own state, not a stale one -- a freshly seeded
@@ -311,6 +337,65 @@ def create_app():
             flash(message, "info")
         return _back_to(restaurant_id)
 
+    # --- checking a restaurant now ---------------------------------------
+
+    @app.post("/restaurant/<int:restaurant_id>/check")
+    def check_now(restaurant_id):
+        """Re-poll Google Places for this one restaurant, right now.
+
+        The cheap half of a check only. A full check would also ask Claude
+        whether there's closure news about the place, and that call is allowed
+        120 seconds before it gives up -- a page cannot sit on that, and it
+        spends real credits per press. So this fetches businessStatus, writes
+        the result, fires the same alerts and archives on the same rule as a
+        scheduled run, and leaves the closing-soon flag exactly where it was.
+        Only a news check moves that flag, and news checks stay on the weekly
+        schedule; the button's title says so on the page.
+
+        Scoped to the rows a scheduled run would check (`_is_checkable`), so
+        an unverified or archived restaurant is a 400 rather than a check the
+        weekly run would never have made. Neither is reachable from the page
+        -- this is for a stale tab or a crafted post.
+        """
+        _require_csrf()
+        restaurant = get_restaurant(restaurant_id)
+        if restaurant is None:
+            abort(404)
+        if not _is_checkable(restaurant):
+            abort(400, "That restaurant isn't being checked -- verify it, or "
+                       "re-activate it, first.")
+
+        previous = restaurant["business_status"]
+        try:
+            result = check_one(restaurant)
+        except Exception:
+            # Places was unreachable (or the key is wrong). check_one writes
+            # nothing before the fetch returns, so there's no half-applied
+            # check to explain -- say so and leave the row as it was.
+            logger.exception("Manual check failed for %s (id=%s)",
+                             restaurant["name"], restaurant_id)
+            flash(f"Couldn't reach Google Places to check {restaurant['name']}"
+                  " — nothing was changed.", "warn")
+            return _back_to(restaurant_id)
+
+        status = result["status"]
+        label = _STATUS_LABELS.get(status, status)
+        logger.info("Checked %s (id=%s) from the dashboard: %s",
+                    restaurant["name"], restaurant_id, status)
+
+        if status == previous:
+            flash(f"Checked {restaurant['name']} — still {label}.", "info")
+        elif status == "CLOSED_PERMANENTLY":
+            # check_one archived it and sent the alert; the row is about to
+            # drop out of the active list, so say where it went.
+            flash(f"{restaurant['name']} is now {label}. It's been archived.",
+                  "warn")
+        elif status in _ATTENTION_STATUSES:
+            flash(f"{restaurant['name']} is now {label}.", "warn")
+        else:
+            flash(f"{restaurant['name']} is {label} again.", "info")
+        return _back_to(restaurant_id)
+
     # --- removing a restaurant -------------------------------------------
 
     @app.post("/restaurant/<int:restaurant_id>/delete")
@@ -392,7 +477,7 @@ def create_app():
         logger.info("Rejected %s (id=%s, place_id=%s) as the wrong place -- deleted",
                     restaurant["name"], restaurant_id, restaurant["place_id"])
         flash(f"Removed {restaurant['name']}. Search again with a street or city "
-              "\\u2014 that's what narrows it down.", "info")
+              "\u2014 that's what narrows it down.", "info")
         # The stored address belongs to the wrong place, so only the name is
         # carried over; re-using the address would just find it again.
         return redirect(url_for("index", q=restaurant["name"][:MAX_QUERY_CHARS]))

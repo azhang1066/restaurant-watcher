@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_status.html" import badges, delete_form, unarchive_form, verify_forms %}
+{% from "_status.html" import badges, check_form, delete_form, unarchive_form, verify_forms %}
 
 {% block content %}
   <h1>Restaurant Watcher</h1>
@@ -77,7 +77,7 @@
           <th class="hide-narrow">Last checked</th>
           {#- No label: the buttons below say what they do, and a "Delete"
               heading over a column of Delete buttons reads as a threat. -#}
-          <th><span class="sr-only">Remove</span></th>
+          <th><span class="sr-only">Actions</span></th>
         </tr>
       </thead>
       <tbody>
@@ -105,9 +105,15 @@
               {% endif %}
             </td>
             {#- Deliberately the last column and not hidden on narrow screens:
-                it's the only irreversible button on the page, so it stays away
-                from the restaurant's own link, and stays reachable. -#}
-            <td class="keep">{{ delete_form(r) }}</td>
+                Delete is the only irreversible button on the page, so it stays
+                away from the restaurant's own link, and stays reachable. Check
+                now sits to its left rather than beside the status it refreshes,
+                so the rightmost thing under the pointer is still the one that
+                asks before it acts. -#}
+            <td class="keep actions">
+              {% if r.checkable %}{{ check_form(r, 'index') }}{% endif %}
+              {{ delete_form(r) }}
+            </td>
           </tr>
         {% else %}
           <tr><td class="empty" colspan="4">

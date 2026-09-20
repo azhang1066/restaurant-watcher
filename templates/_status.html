@@ -34,6 +34,26 @@
   </form>
 {%- endmacro %}
 
+{#- Re-check one restaurant's Google Places status on demand.
+
+    Only rendered for a row a scheduled run would actually check -- `checkable`
+    comes from app._view(), which shares its rule with the route's guard, so
+    this button is never shown where the POST would be refused.
+
+    The title spells out what the button does *not* do. "Check now" next to a
+    Closing soon badge otherwise reads as a promise to go and re-read the news,
+    which is the expensive half and stays on the weekly schedule.
+-#}
+{% macro check_form(r, return_to) -%}
+  <form class="inline" method="post"
+        action="{{ url_for('check_now', restaurant_id=r.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="action" type="submit"
+            title="Ask Google whether this place is still open, now. Doesn't re-run the closing-soon news check -- that stays on the weekly schedule.">Check now</button>
+  </form>
+{%- endmacro %}
+
 {#- Stop watching a restaurant for good: the row and its check history go.
 
     The confirm() is the whole guard, so it names the restaurant -- in a table

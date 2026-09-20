@@ -78,6 +78,11 @@
     button.action:hover { border-color: var(--accent); color: var(--accent); }
     button.action.danger:hover { border-color: var(--bad); color: var(--bad); }
     form.inline { display: inline; margin: 0; }
+    /* Two inline forms in one cell. The gap is what stops "Check now" and
+       "Delete" sitting flush against each other on a narrow screen, where a
+       mis-tap costs a restaurant's history. */
+    td.actions { white-space: nowrap; }
+    td.actions form.inline + form.inline { margin-left: .4rem; }
     form.add {
       display: flex; flex-wrap: wrap; gap: .5rem; align-items: center;
       padding: .75rem; margin: 0 0 1.5rem;
