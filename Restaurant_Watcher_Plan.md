@@ -1,16 +1,16 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-17, against 9 commits through `e1f9d2b` ("Users can now add
-restaurants through the dashboard") plus uncommitted work: the first-check
-verification gate (`db.verified_at` + migration, `main.run_check` skipping unverified
-rows, `notifier.notify_needs_verification()`, the dashboard's verify/reject routes and
-pending section) and the ntfy header-encoding fix it turned up. The tests are
-comfortably the largest part of the repo. This plan tracks open work only; finished
-items (HTTP retries everywhere including the Anthropic SDK, the test suite, email
-notifications, log pruning, call-time config, `run_check` coverage, the
-notify-on-transition fixes, the ntfy emoji-title bug, and Phase 2's read-only view,
-re-activate action, add-a-restaurant flow and verification gate) are dropped once
-done — see git history for what landed._
+_Last reviewed: 2026-09-20, against 13 commits through `6c95db5` ("Adding force check
+button for a single restaurant to the UI"), tree clean. The tests are comfortably the
+largest part of the repo. This plan tracks open work only; finished items (HTTP retries
+everywhere including the Anthropic SDK, the test suite, email notifications, log
+pruning, call-time config, `run_check` coverage, the notify-on-transition fixes, the
+ntfy emoji-title bug, and Phase 2's read-only view, re-activate action,
+add-a-restaurant flow, verification gate, delete action and on-demand check) are
+dropped once done — see git history for what landed._
+
+_Phase 2 is finished apart from auth. Every routine action now has a button; the only
+reason left to open a terminal is to run the scheduler itself._
 
 ## 1. Technical Overview
 
@@ -24,14 +24,14 @@ dashboard's templates):
 
 | File | Role |
 |---|---|
-| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), splits the active list into verified (checked) and unverified (skipped entirely, one batched push per run), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. Cadence/retention config is read per run via `_closing_soon_check_every()` / `_check_log_retain_days()`. |
-| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()`, `check_history()`, `get_restaurant()`, `get_restaurant_by_place_id()` (the add flow's "already tracking this?" check — `add_restaurant()` dedupes by quietly ignoring the insert, so nothing else can tell), `unarchive_restaurant()` (the inverse of `archive_restaurant()`; touches only `archived`), `verify_restaurant()` (writes `verified_at` once, so a double submit reports a repeat rather than moving the date) and `delete_restaurant()` (row + `check_log` + rollups; the wrong-match path). `init_db()` also settles any `closing_soon_flag` left set on a permanently closed row, and runs `_migrate()` — the one ALTER that adds `verified_at`, backfilling it for rows that had already been checked so an existing install doesn't silently stop watching everything. |
+| `main.py` | Orchestrator. Loads env, runs the check loop (once or via `BlockingScheduler`), splits the active list into verified (checked) and unverified (skipped entirely, one batched push per run), decides which restaurants get the expensive news check this run, and kicks off log pruning afterwards. Cadence/retention config is read per run via `_closing_soon_check_every()` / `_check_log_retain_days()`. `check_one()` is one restaurant's whole check — Places poll, optional news check, write, notify, archive — lifted out of the loop so the dashboard's on-demand button runs the same code rather than a second copy of those rules (which would drift on *when an alert fires*, and drift there is silent). It deliberately never touches the run counter: that counter decides when the next news check falls due for the whole list, so pressing a button on one restaurant must not move the schedule for the rest. |
+| `db.py` | SQLite schema + CRUD. Three tables: `restaurants` (current state), `check_log` (recent per-check history) and `check_log_monthly` (rollups of pruned `check_log` rows). Also `prune_check_log()`, `check_history()`, `get_restaurant()`, `get_restaurant_by_place_id()` (the add flow's "already tracking this?" check — `add_restaurant()` dedupes by quietly ignoring the insert, so nothing else can tell), `unarchive_restaurant()` (the inverse of `archive_restaurant()`; touches only `archived`), `verify_restaurant()` (writes `verified_at` once, so a double submit reports a repeat rather than moving the date) and `delete_restaurant()` (row + `check_log` + rollups; shared by the wrong-match reject path and the dashboard's Delete button). `init_db()` also settles any `closing_soon_flag` left set on a permanently closed row, and runs `_migrate()` — the one ALTER that adds `verified_at`, backfilling it for rows that had already been checked so an existing install doesn't silently stop watching everything. |
 | `places_client.py` | Thin wrapper around Google Places API (New): `find_place_id` (text search, at seed time and behind the dashboard's add form) and `get_business_status` (per-run cheap status poll). `place_summary()` flattens a search hit into the columns `add_restaurant()` takes, shared by `seed.py` and `app.py` so the two can't disagree about what gets stored. Retries via a `urllib3` `Retry` adapter. |
 | `closure_checker.py` | Calls Claude (`claude-sonnet-4-6`) with the `web_search` tool to judge if a restaurant has announced closure news. Returns structured JSON. Retries/timeout are set explicitly on the SDK client rather than inherited. |
 | `notifier.py` | Pushes alerts to a phone via [ntfy.sh](https://ntfy.sh/) (HTTP POST, no auth) and, optionally, by email over SMTP. Three alerts: closed, closing-soon, and needs-verification (batched — one per run, not one per restaurant). `_header_value()` RFC 2047-encodes non-ASCII header values; ntfy carries the title in a header, and `http.client` encodes headers as latin-1, so every emoji title raised `UnicodeEncodeError` before the request left. |
 | `seed.py` | One-time/occasional CLI: reads a text file of restaurant names, resolves each to a Google `place_id`, inserts into the DB. |
-| `app.py` | Flask dashboard. `/` lists every restaurant with status/last-checked age plus the add-a-restaurant search box, `/restaurant/<id>` adds the per-month history, `POST /restaurant/<id>/unarchive` re-activates an archived one, `POST /restaurant/<id>/verify` and `POST /restaurant/<id>/reject` settle an unverified one, and `POST /add` → `GET,POST /add/confirm` is the two-step add (see the data flow below). Reads and writes through `db.py`; the only external call it makes is that one Text Search. No module-level `app`, so importing it has no side effects (Flask's loader finds `create_app()`). Forms carry a session CSRF token (`DASHBOARD_SECRET_KEY`, generated per process if unset). |
-| `templates/` | `base.html` (layout, light/dark tokens, flash messages), `index.html`, `detail.html`, `confirm_add.html` (the "is this the right place?" step), and `_status.html` — macros for the status badges, the re-activate form and the verify/reject pair, shared so the two pages can't disagree about what a state looks like. The badge macro reads `status_known` rather than the status itself, since the column defaults to `OPERATIONAL` and an unverified row is never checked — it would otherwise claim to be open on the strength of a default, forever. Presentation decisions that a count on the page also depends on live in `app._view()`, not in the templates. |
+| `app.py` | Flask dashboard. `/` lists every restaurant with status/last-checked age plus the add-a-restaurant search box, `/restaurant/<id>` adds the per-month history, `POST /restaurant/<id>/unarchive` re-activates an archived one, `POST /restaurant/<id>/verify` and `POST /restaurant/<id>/reject` settle an unverified one, `POST /restaurant/<id>/check` re-polls Places for a single restaurant on demand, `POST /restaurant/<id>/delete` stops watching one for good, and `POST /add` → `GET,POST /add/confirm` is the two-step add (see the data flow below). `_is_checkable()` is the one rule behind both the Check-now button and its route's guard, so the page can't render a button that answers 400. Reads and writes through `db.py`; its only external calls are the add form Text Search and, via `main.check_one`, the Check-now status poll — both in the cheap Places tier, and neither one Claude. No module-level `app`, so importing it builds nothing (Flask's loader finds `create_app()`) — though it now imports `main`, whose import-time work is a `load_dotenv()` and a `logging.basicConfig()` that no-ops once handlers exist. `main` imports nothing from here, so there is no cycle. Forms carry a session CSRF token (`DASHBOARD_SECRET_KEY`, generated per process if unset). |
+| `templates/` | `base.html` (layout, light/dark tokens, flash messages), `index.html`, `detail.html`, `confirm_add.html` (the "is this the right place?" step), and `_status.html` — macros for the status badges, the re-activate form, the verify/reject pair, the delete button (with the `|tojson`-escaped confirm dialog) and the check-now form, shared so the two pages can't disagree about what a state looks like. The badge macro reads `status_known` rather than the status itself, since the column defaults to `OPERATIONAL` and an unverified row is never checked — it would otherwise claim to be open on the strength of a default, forever. Presentation decisions that a count on the page also depends on live in `app._view()`, not in the templates. |
 
 **How they fit together:**
 
@@ -58,6 +58,7 @@ flowchart TD
     dash["app.py (Flask)"] -->|"list_restaurants / get_restaurant / check_history"| db
     dash -->|"unarchive / verify / delete / add_restaurant (POST + CSRF)"| db
     dash -->|"add: find_place_id (confirmed before it's stored)"| places
+    dash -->|"check now: main.check_one, Places half only"| places
     browser["Browser (localhost:5000)"] --> dash
 ```
 
@@ -132,6 +133,26 @@ persisted in SQLite and a plain-text run counter (`data/.run_count`).
    away a restaurant confirmed a year ago. `app._view()`'s `needs_verification` is
    defined as unverified-and-unarchived, matching exactly what `run_check` skips,
    because that loop only reads the active list.
+8. **Checks can also be run one at a time, from the dashboard** — and only the
+   cheap half. `POST /restaurant/<id>/check` calls the same `main.check_one()`
+   the scheduler does, with `include_news_check=False`: it polls Places, writes
+   the row and the `check_log` entry, and fires the same alerts and archiving on
+   the same rules. The news check stays on the weekly schedule because it's
+   allowed 120 seconds before giving up, which is not something a request thread
+   can sit on, and because a button that spends Claude credits per press is a
+   different kind of button. Two consequences: the closing-soon flag is carried
+   forward untouched (only a news check moves it), and the run counter is left
+   alone, so clicking here can't delay the news check for everything else. The
+   button is offered — and the route honoured — only for rows a scheduled run
+   would check; unverified or archived is a 400, which is reachable from a stale
+   tab and nowhere else.
+9. **Deleting is the third removal path**, alongside archiving and rejecting, and
+   the only one that will touch a restaurant whose history is real. That's why
+   it's the only one behind a browser confirm dialog naming the restaurant, and
+   why the route logs the `place_id` needed to re-add it. Archiving stays the
+   soft option and the one a permanent closure triggers by itself; rejecting is
+   scoped to unverified rows. Deleting is for somewhere you simply don't want
+   watched any more, so it's allowed on anything, archived rows included.
 
 ### Test coverage
 `tests/` covers `db` (state transitions, pruning, rollups), `closure_checker` (JSON
@@ -173,8 +194,24 @@ that rejecting a *verified* row is a 400, and that neither runs without CSRF or 
 GET. `test_notifier.py` gained the round trip that the emoji-title bug broke — the
 header has to be latin-1 safe *and* decode back to the original text.
 
-144 tests, all passing (`app` 62, `main` 34, `db` 19, `notifier` 12, `closure_checker` 8,
-`places_client` 6, `seed` 3). The HTTP halves of `places_client.py` remain uncovered — faking
+The on-demand check is tested mostly for what it *doesn't* do: several tests assert
+the news check never fired, and others pin the flag being carried forward, the run
+counter being left alone, and the button appearing on exactly the rows whose POST
+would be honoured (one rule, `_is_checkable`, asserted from both ends). What it does
+share with a scheduled run — notify on a move into closed, archive and settle the flag
+on a permanent closure, append to the history — is asserted here too rather than
+assumed from `test_main.py`, since the point of the extraction was that the two agree.
+A dead Places API is a flash with nothing written. Deleting is covered for the row and
+its history going together, for the `|tojson`-escaped confirm dialog surviving an
+apostrophe (`&#39;` would end the JavaScript string early and delete without asking),
+and for a double submit reading as "already removed" rather than a 404.
+One test exists purely because a string went unasserted for a while: the reject flash
+had a doubled `\\u2014` escape and rendered the six literal characters on screen, so
+`test_reject_flash_renders_its_em_dash` now pins the dash *and* the absence of the
+escape.
+
+178 tests, all passing (`app` 98, `main` 34, `db` 19, `notifier` 12, `closure_checker` 8,
+`places_client` 4, `seed` 3). The HTTP halves of `places_client.py` remain uncovered — faking
 `requests` there would only assert the mock. `tests/test_seed.py` covers
 seed.py's wiring rather than its network half: that it loads `.env` at import
 (it didn't, so seeding failed asking for a key that was already in `.env` —
@@ -204,8 +241,9 @@ fatal.
 - No dedup/backoff beyond these state-transition checks in `main.py`; no notification log. `tests/test_main.py` is what pins all of this down.
 
 ### Gaps / risks worth knowing about
-- The dashboard has no auth and binds to localhost only. Fine as-is; it becomes a real decision the moment anyone wants it reachable from a phone, which is also the point where the personal restaurant list stops being local-only data. The add form raises the stakes slightly: a page that spends money per click is worse to expose than one that only reads.
-- The add flow has no rate limit — nothing stops a held-down Enter key from running one Text Search per submit. Acceptable for one user pressing a button on localhost, and the first thing to revisit if this is ever exposed or scripted.
+- The dashboard has no auth and binds to localhost only. Fine as-is; it becomes a real decision the moment anyone wants it reachable from a phone, which is also the point where the personal restaurant list stops being local-only data. The buttons raise the stakes: a page that spends money per click and deletes history per click is a different thing to expose than one that only reads.
+- Neither spending button has a rate limit — nothing stops a held-down Enter key from running one Text Search per add submit, or one `businessStatus` call per Check-now press. Both are cheap-tier and both are bounded by how fast a person can click, which is the whole of the argument for leaving it; it's the first thing to revisit if this is ever exposed or scripted. Worth noting the ceiling moved: it used to be reachable only from the add box, and it's now on every row.
+- Delete is irreversible and guarded only by a client-side `confirm()`. That's a dialog's nature rather than a hole to plug — the route logs the `place_id` so a mistake is re-addable from the log — but a browser with JavaScript off submits it without asking.
 - It's served by Flask's development server. Fine for a personal tool on localhost; a real deployment needs a WSGI server in front.
 - CSRF tokens live in a session cookie signed with `DASHBOARD_SECRET_KEY`. Unset, a per-process key is generated and open pages stop working after a restart (a reload fixes it). That's the right trade for one user on localhost and the wrong one the moment the app is served to anything else.
 - **Verifying is one-at-a-time, and `restaurants.txt` is 531 lines.** Seeding the
@@ -229,30 +267,27 @@ This is the natural "new feature," and matches what `notifier.py`'s docstring im
 - Reuse the existing `restaurants` table (add columns) or a new `reservation_watches` table if watches need their own party-size/date-range/cadence config per restaurant.
 - New notification type via the existing `notifier.py` (`notify_table_available`).
 
-### Phase 2 — Dashboard: remaining manual actions
-The read-only view, the re-activate action and adding a restaurant have all landed, so
-the dashboard is now the place the tool is driven from rather than a viewer — the only
-routine reason left to touch a terminal is running the checks. One action is still open:
-- **Force a check now** — runs `run_check()` for one restaurant. `run_check` currently
-  only does all-or-nothing over the active list and owns the run counter, so a
-  single-restaurant path means either a parameter or a narrower extracted helper.
-  Doing this from a request thread also makes a page hang on Places/Anthropic latency
-  — the add flow doesn't have this problem (one Text Search returns in well under a
-  second), but a news check behind the same button would, so this needs its design
-  decision made before it's built.
-- Auth is still undecided, and is the blocker for serving this anywhere but localhost
-  now that buttons on the page change state and spend money.
+### Phase 2 — Dashboard: auth
+Every manual action has landed — read-only view, re-activate, add, verify/reject,
+delete and the on-demand check. The dashboard is now where the tool is driven from,
+and the only routine reason left to open a terminal is running the scheduler. One
+thing is still open, and it's the one that gates everything else:
+- **Auth**, the blocker for serving this anywhere but localhost. The stakes have only
+  gone up: the page now has buttons that spend money (Search, Check now) and a button
+  that destroys history (Delete), so "it's read-only, who cares" stopped being true
+  two features ago. Needed before this is reachable from a phone, which is also the
+  point where a personal restaurant list stops being local-only data.
+- Related and unbuilt: **bulk verify**, which is listed under the risks above and is
+  the thing standing between the current empty DB and a seeded `restaurants.txt`.
 
 ### Phase 3 — Efficiency / scale polish (once restaurant count grows)
 - Batch Places status checks if/when Google's API supports it, or at least add concurrency (`concurrent.futures`) to the per-restaurant loop — currently fully serial.
 - Per-restaurant check cadence instead of one global schedule (e.g. check closing-soon news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. Commit the verification gate and the ntfy header fix (`db.py`, `main.py`, `notifier.py`, `app.py`, `templates/`, `tests/`, README + `.env.example`) — the tree has been clean at every other checkpoint.
-2. **Confirm an alert actually arrives on the phone.** The emoji-title bug means no ntfy notification this tool has ever sent can have been delivered — `run_check` caught the `UnicodeEncodeError` inside the per-restaurant `except` and logged it as a failed check. Worth one deliberate `notify()` against the real topic to prove the fix end to end, since every test fakes the POST.
-3. Use the add form against the real Places API with a real key. Every test fakes `find_place_id`, so the response *shape* (`displayName.text`, `formattedAddress`, `googleMapsUri` all present on a real hit) is assumed, not verified — and a deliberately ambiguous query is the way to see whether the confirm page actually gives you enough to catch a wrong match.
-4. Seed the DB and triage the verify queue against real data. Note `restaurants.txt`
+1. **Confirm an alert actually arrives on the phone.** The emoji-title bug means no ntfy notification this tool has ever sent can have been delivered — `run_check` caught the `UnicodeEncodeError` inside the per-restaurant `except` and logged it as a failed check. Worth one deliberate `notify()` against the real topic to prove the fix end to end, since every test fakes the POST.
+2. Use the add form against the real Places API with a real key. Every test fakes `find_place_id`, so the response *shape* (`displayName.text`, `formattedAddress`, `googleMapsUri` all present on a real hit) is assumed, not verified — and a deliberately ambiguous query is the way to see whether the confirm page actually gives you enough to catch a wrong match. **Check now** is the cheap way to exercise the other Places call in the same sitting — one press proves the key, the field mask and the status parse against a real place.
+3. Seed the DB and triage the verify queue against real data. Note `restaurants.txt`
    is 531 lines — that's 531 Text Search calls (order of $15-20) and 531 rows to
    verify by hand, so trim it or build a bulk-verify action first. `data/restaurants.db` exists but holds 0 rows, so the dashboard has only ever been rendered against fixtures — and a full `restaurants.txt` is also the first real test of whether clicking through a long pending list is tolerable, or whether it needs a "verify all" escape hatch.
-5. Decide whether "force a check now" is wanted before Phase 1, and if so how it avoids hanging a request thread (background thread, a job row the scheduler picks up, or restricting the button to the cheap Places half).
-6. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
+4. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.

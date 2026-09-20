@@ -201,6 +201,11 @@ Checks themselves still run from `main.py`.
 Both steps are skipped entirely for a restaurant you haven't verified yet;
 see [Verifying a restaurant](#verifying-a-restaurant).
 
+The dashboard's **Check now** button runs step 1 on a single restaurant,
+never step 2 -- see [Checking a restaurant now](#checking-a-restaurant-now).
+Both paths go through the same `main.check_one()`, so a manual check writes,
+alerts and archives exactly as a scheduled one does.
+
 Permanent closures auto-archive the restaurant after notifying; temporary
 closures and closing-soon flags stay active so you keep getting the
 context on future runs.
@@ -221,4 +226,10 @@ per-month view. Set `CHECK_LOG_RETAIN_DAYS=0` to keep everything.
   calls) as long as you don't add fields like `rating` or `currentOpeningHours`
   to the field mask -- those bump the whole call to the pricier Enterprise tier.
 - The Claude + web search step is the main cost driver; the `CLOSING_SOON_CHECK_EVERY`
-  setting in `.env` controls how often it runs.
+  setting in `.env` controls how often it runs. Nothing on the dashboard triggers
+  it -- **Check now** is deliberately the Places half only, so no button on the
+  page can run up a Claude bill.
+- Two dashboard buttons do spend, both in the cheap tier and both once per
+  press, with no rate limit in front of them: **Search** (one Text Search) and
+  **Check now** (one `businessStatus` call). Fine for one person clicking on
+  localhost; it's the first thing to revisit if the dashboard is ever exposed.
