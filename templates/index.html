@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_status.html" import badges, unarchive_form, verify_forms %}
+{% from "_status.html" import badges, delete_form, unarchive_form, verify_forms %}
 
 {% block content %}
   <h1>Restaurant Watcher</h1>
@@ -75,6 +75,9 @@
           <th>Restaurant</th>
           <th>Status</th>
           <th class="hide-narrow">Last checked</th>
+          {#- No label: the buttons below say what they do, and a "Delete"
+              heading over a column of Delete buttons reads as a threat. -#}
+          <th><span class="sr-only">Remove</span></th>
         </tr>
       </thead>
       <tbody>
@@ -101,9 +104,13 @@
                 <span class="muted">never</span>
               {% endif %}
             </td>
+            {#- Deliberately the last column and not hidden on narrow screens:
+                it's the only irreversible button on the page, so it stays away
+                from the restaurant's own link, and stays reachable. -#}
+            <td class="keep">{{ delete_form(r) }}</td>
           </tr>
         {% else %}
-          <tr><td class="empty" colspan="3">
+          <tr><td class="empty" colspan="4">
             Nothing tracked yet &mdash; search for one above, or seed a whole list
             with <code>python seed.py restaurants.txt</code>.
           </td></tr>

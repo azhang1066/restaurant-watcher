@@ -9,6 +9,7 @@ file by hand. This serves:
                                  db.unarchive_restaurant for the caveat)
     /restaurant/<id>/verify      POST: confirm this is the right place
     /restaurant/<id>/reject      POST: it wasn't -- delete it and search again
+    /restaurant/<id>/delete      POST: stop watching it -- delete row + history
     /add                         POST: search Google Places for a name
     /add/confirm                 GET: show the match, POST: track it
 
@@ -33,6 +34,13 @@ already verified -- that page is the yes -- so this only ever asks about
 places nobody has actually looked at. Saying no deletes the row outright
 rather than archiving it, because its history describes a different
 restaurant; the search box is re-opened with the name filled in.
+
+Deleting is the same removal offered for its own sake, from the list itself:
+somewhere you simply don't want watched any more. It's the only destructive
+button that will touch a restaurant whose history is real, so it's the only
+one that asks the browser to confirm first. Archiving stays the softer
+option, and is what a closure triggers on its own -- the row and its months
+of history stay on the page, greyed out.
 
 Because there is now a state-changing route, every form carries a CSRF token
 tied to the session -- see `_csrf_token()`. That needs a signing key, so set
@@ -302,6 +310,45 @@ def create_app():
         else:
             flash(message, "info")
         return _back_to(restaurant_id)
+
+    # --- removing a restaurant -------------------------------------------
+
+    @app.post("/restaurant/<int:restaurant_id>/delete")
+    def delete(restaurant_id):
+        """Stop watching a restaurant: drop the row and everything logged
+        about it.
+
+        Not the same destruction as `reject`, which throws a row away because
+        its history describes a *different* restaurant. This one deletes a
+        place that really was the right match, history and all, so it's the
+        button a confirmation dialog guards -- see delete_form in
+        _status.html. That dialog is client-side and so not a security
+        control; it's there because the row is unrecoverable, which is also
+        why the removal is logged with the place_id needed to re-add it.
+
+        Archiving remains the gentler option for somewhere that closed: the
+        row stays listed, greyed out, and its months of history stay
+        queryable. This is for a restaurant you don't want watched at all.
+
+        Always lands on the index -- the detail page it may have been pressed
+        from no longer exists -- so there's no `return_to` to honour.
+        """
+        _require_csrf()
+        restaurant = get_restaurant(restaurant_id)
+        if restaurant is None:
+            # Already gone: a double submit, or a tab left open past the row
+            # being deleted elsewhere. Unlike the other routes this doesn't
+            # 404, because the state the request asked for is the state we're
+            # in -- and the page that would show the 404 is itself gone.
+            flash("That restaurant had already been removed.", "info")
+            return redirect(url_for("index"))
+
+        delete_restaurant(restaurant_id)
+        logger.info("Deleted %s (id=%s, place_id=%s) from the dashboard",
+                    restaurant["name"], restaurant_id, restaurant["place_id"])
+        flash(f"Removed {restaurant['name']} \u2014 it won't be checked again.",
+              "info")
+        return redirect(url_for("index"))
 
     # --- verifying a restaurant ------------------------------------------
 

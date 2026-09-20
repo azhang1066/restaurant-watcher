@@ -77,6 +77,20 @@ Archived restaurants stay listed, greyed out, rather than disappearing.
 Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
 has quietly died otherwise looks just like a week with no bad news.
 
+### Removing a restaurant
+
+Each row in the table ends with a **Delete** button: the restaurant stops
+being checked, and its row and check history are removed. The browser asks
+you to confirm by name first, because nothing here can put it back -- only
+the log line records what went, place_id included.
+
+Deleting is for somewhere you no longer care about. **Archiving** is the
+softer option and the one a permanent closure triggers by itself: the row
+stays in the table, greyed out, skipped by the weekly check, with its history
+intact and a **Re-activate** button if the place turns out to have reopened.
+Archived rows keep their Delete button too -- a closure you've read about is
+often exactly the thing you want off the page.
+
 ### Verifying a restaurant
 
 A name search returns exactly one guess with no confidence beside it, so the

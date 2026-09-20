@@ -34,6 +34,29 @@
   </form>
 {%- endmacro %}
 
+{#- Stop watching a restaurant for good: the row and its check history go.
+
+    The confirm() is the whole guard, so it names the restaurant -- in a table
+    of twenty rows, "are you sure?" can't tell you that you pressed the wrong
+    line's button. The name goes through |tojson rather than straight into the
+    string: autoescaping would turn the apostrophe in "Joe's" into &#39;, which
+    the HTML parser hands back to JavaScript as a quote that ends the string
+    early. |tojson escapes it (and < > &) as \uXXXX instead, and leaves " alone
+    -- hence the single-quoted attribute around double-quoted JS.
+
+    A browser with JavaScript off submits without asking, which is a dialog's
+    nature rather than something to paper over; the route logs what it removed,
+    place_id included.
+-#}
+{% macro delete_form(r) -%}
+  <form class="inline" method="post"
+        action="{{ url_for('delete', restaurant_id=r.id) }}"
+        onsubmit='return confirm("Stop watching " + {{ r.name|tojson }} + "? Its check history will be deleted too, and this cannot be undone.")'>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="action danger" type="submit">Delete</button>
+  </form>
+{%- endmacro %}
+
 {#- Confirm-or-discard buttons for a restaurant nobody has vouched for yet.
     Two forms, because they're two routes: verifying comes back to the page it
     was pressed on, while rejecting deletes the row and so has nowhere to come

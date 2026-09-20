@@ -827,3 +827,130 @@ def test_unverified_count_matches_the_rows_on_the_page(client):
 
     assert "<b>2</b><span>To verify</span>" in body
     assert body.count("Needs verifying") == 2
+# --- deleting a restaurant ----------------------------------------------
+
+def _post_delete(client, restaurant_id, token=None, follow_redirects=False, **fields):
+    data = {"csrf_token": _csrf(client) if token is None else token, **fields}
+    return client.post(f"/restaurant/{restaurant_id}/delete", data=data,
+                       follow_redirects=follow_redirects)
+
+
+def test_every_row_offers_a_delete_button(client):
+    """Including the archived one: archiving is what the checker does on a
+    closure, so "I don't want this watched" is still unanswered for those
+    rows -- and they're the likeliest thing anyone wants gone."""
+    active_id = _add("Lilia", "place-lilia")
+    archived_id = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
+    db.archive_restaurant(archived_id)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert f"/restaurant/{active_id}/delete" in body
+    assert f"/restaurant/{archived_id}/delete" in body
+    assert body.count(">Delete<") == 2
+
+
+def test_delete_button_asks_for_confirmation(client):
+    _add("Lilia", "place-lilia")
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "return confirm(" in body
+    assert "cannot be undone" in body
+
+
+def test_delete_confirmation_survives_an_apostrophe_in_the_name(client):
+    """A name goes into a JavaScript string, and autoescaping alone would put
+    a bare quote there (&#39; is a quote by the time JS sees it) -- ending the
+    string early and taking the confirm() with it, so the button would delete
+    without asking. |tojson is what keeps that from happening."""
+    _add("Katz's Delicatessen", "place-katz")
+
+    body = client.get("/").get_data(as_text=True)
+    onsubmit = re.search(r"onsubmit='([^']+)'", body).group(1)
+
+    # The escape has to be the \u form: &#39; here would be a real quote by the
+    # time the JavaScript engine sees the attribute.
+    assert r"Katz\u0027s Delicatessen" in onsubmit
+    assert "&#39;" not in onsubmit
+
+
+def test_delete_removes_the_restaurant_and_its_history(client):
+    restaurant_id = _add("Lilia", "place-lilia")
+    db.update_check_result(restaurant_id, "OPERATIONAL", False, "")
+
+    _post_delete(client, restaurant_id)
+
+    assert db.get_restaurant(restaurant_id) is None
+    assert db.check_history(restaurant_id) == []
+
+
+def test_delete_leaves_the_other_restaurants_alone(client):
+    doomed = _add("Lilia", "place-lilia")
+    kept = _add("Don Angie", "place-don-angie")
+
+    _post_delete(client, doomed)
+
+    assert [r["id"] for r in db.list_restaurants(active_only=False)] == [kept]
+
+
+def test_delete_works_on_a_verified_restaurant(client):
+    """Unlike /reject, which guards a confirmed row against a stale tab. Here
+    deleting one is the entire point, and the dialog is the guard."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    assert db.get_restaurant(restaurant_id)["verified_at"] is not None
+
+    response = _post_delete(client, restaurant_id)
+
+    assert response.status_code == 302
+    assert db.get_restaurant(restaurant_id) is None
+
+
+def test_delete_returns_to_the_list_and_says_what_went(client):
+    restaurant_id = _add("Lilia", "place-lilia")
+
+    response = _post_delete(client, restaurant_id)
+    assert response.headers["Location"] == "/"
+
+    body = _text(client.get("/"))
+    assert "Removed Lilia" in body
+    assert "Lilia" not in body.split("<tbody>")[1]
+
+
+def test_delete_requires_a_csrf_token(client):
+    restaurant_id = _add("Lilia", "place-lilia")
+
+    response = _post_delete(client, restaurant_id, token="wrong")
+
+    assert response.status_code == 400
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_delete_is_unreachable_by_get(client):
+    restaurant_id = _add("Lilia", "place-lilia")
+
+    assert client.get(f"/restaurant/{restaurant_id}/delete").status_code == 405
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_delete_of_an_already_deleted_restaurant_is_not_an_error(client):
+    """A double-clicked button. The row is gone either way, which is what was
+    asked for, and a 404 page in place of the list would look like a bug."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    _post_delete(client, restaurant_id)
+
+    body = _text(_post_delete(client, restaurant_id, follow_redirects=True))
+
+    assert "had already been removed" in body
+
+
+def test_delete_button_round_trips_a_token_from_the_rendered_page(client):
+    """The POSTs above seed the session, so nothing else here would notice the
+    form and the check disagreeing about the field name."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    body = client.get("/").get_data(as_text=True)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+
+    client.post(f"/restaurant/{restaurant_id}/delete", data={"csrf_token": token})
+
+    assert db.get_restaurant(restaurant_id) is None

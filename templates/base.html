@@ -54,6 +54,12 @@
     .badge.warn { background: var(--warn-bg); color: var(--warn); }
     .badge.bad { background: var(--bad-bg); color: var(--bad); }
     .muted { color: var(--muted); }
+    /* A heading a screen reader announces and the page doesn't show -- used
+       for the action column, where a visible "Delete" title would shout. */
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; overflow: hidden;
+      clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+    }
     .small { font-size: .8125rem; }
     .row-archived td:not(.keep) { opacity: .55; }
     .empty { padding: 2rem .75rem; text-align: center; color: var(--muted); }
