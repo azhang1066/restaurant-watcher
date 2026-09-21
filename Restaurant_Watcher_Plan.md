@@ -1,16 +1,21 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-20, against 13 commits through `6c95db5` ("Adding force check
-button for a single restaurant to the UI"), tree clean. The tests are comfortably the
-largest part of the repo. This plan tracks open work only; finished items (HTTP retries
-everywhere including the Anthropic SDK, the test suite, email notifications, log
-pruning, call-time config, `run_check` coverage, the notify-on-transition fixes, the
-ntfy emoji-title bug, and Phase 2's read-only view, re-activate action,
-add-a-restaurant flow, verification gate, delete action and on-demand check) are
-dropped once done — see git history for what landed._
+_Last reviewed: 2026-09-20, against 14 commits through `cef4211` ("Updating docs"),
+tree clean. The tests are comfortably the largest part of the repo. This plan tracks
+open work only; finished items (HTTP retries everywhere including the Anthropic SDK,
+the test suite, email notifications, log pruning, call-time config, `run_check`
+coverage, the notify-on-transition fixes, the ntfy emoji-title bug, Phase 2's
+read-only view, re-activate action, add-a-restaurant flow, verification gate, delete
+action and on-demand check, and the real-key pass over both Places calls) are dropped
+once done — see git history for what landed._
 
 _Phase 2 is finished apart from auth. Every routine action now has a button; the only
 reason left to open a terminal is to run the scheduler itself._
+
+_The DB is no longer a fixture. `restaurants.txt` has been seeded (526 lines in, 505
+rows out) and both Places calls have been exercised against the real API with a real
+key — the add form's Text Search, and `GET /places/{id}` via seven Check-now presses.
+The verify queue is being worked through by hand: 207 verified, 298 outstanding._
 
 ## 1. Technical Overview
 
@@ -246,12 +251,13 @@ fatal.
 - Delete is irreversible and guarded only by a client-side `confirm()`. That's a dialog's nature rather than a hole to plug — the route logs the `place_id` so a mistake is re-addable from the log — but a browser with JavaScript off submits it without asking.
 - It's served by Flask's development server. Fine for a personal tool on localhost; a real deployment needs a WSGI server in front.
 - CSRF tokens live in a session cookie signed with `DASHBOARD_SECRET_KEY`. Unset, a per-process key is generated and open pages stop working after a restart (a reload fixes it). That's the right trade for one user on localhost and the wrong one the moment the app is served to anything else.
-- **Verifying is one-at-a-time, and `restaurants.txt` is 531 lines.** Seeding the
-  real file would leave 531 rows to click through individually, with `run_check`
-  checking none of them until that's done. A "verify all" (or verify-by-page) action
-  is the obvious escape hatch and isn't built; whether it's wanted depends on whether
-  the list is trusted in bulk, which rather defeats the point for the ambiguous names
-  in it. Worth deciding before seeding, not after.
+- **Verifying is one-at-a-time, and 298 rows are still waiting.** The file is seeded,
+  so this stopped being a decision and became a queue: verification has run at 49 rows
+  on 09-17, 19 on 09-19 and 139 on 09-20, and `run_check` watches none of the
+  remaining 298 until they're cleared. A "verify all" (or verify-by-page) action is
+  still unbuilt, and whether it's wanted still turns on whether the list is trusted in
+  bulk — which rather defeats the point for the ambiguous names in it. The pace above
+  is the evidence for deciding; hand-triage has been tolerable so far.
 - The needs-verifying push re-fires every run while anything is waiting. That's the
   design (those restaurants aren't being watched, so the nag is the point) and it's
   self-limiting at one push a week, but it's the first thing to revisit if a seeded
@@ -277,8 +283,9 @@ thing is still open, and it's the one that gates everything else:
   that destroys history (Delete), so "it's read-only, who cares" stopped being true
   two features ago. Needed before this is reachable from a phone, which is also the
   point where a personal restaurant list stops being local-only data.
-- Related and unbuilt: **bulk verify**, which is listed under the risks above and is
-  the thing standing between the current empty DB and a seeded `restaurants.txt`.
+- Related and unbuilt: **bulk verify**, which is listed under the risks above. Seeding
+  happened without it, so it no longer gates starting — it's now only the question of
+  whether hand-verifying the remaining 298 rows stays tolerable to the end.
 
 ### Phase 3 — Efficiency / scale polish (once restaurant count grows)
 - Batch Places status checks if/when Google's API supports it, or at least add concurrency (`concurrent.futures`) to the per-restaurant loop — currently fully serial.
@@ -286,8 +293,16 @@ thing is still open, and it's the one that gates everything else:
 
 ## 4. Concrete Next Steps (start of next session)
 1. **Confirm an alert actually arrives on the phone.** The emoji-title bug means no ntfy notification this tool has ever sent can have been delivered — `run_check` caught the `UnicodeEncodeError` inside the per-restaurant `except` and logged it as a failed check. Worth one deliberate `notify()` against the real topic to prove the fix end to end, since every test fakes the POST.
-2. Use the add form against the real Places API with a real key. Every test fakes `find_place_id`, so the response *shape* (`displayName.text`, `formattedAddress`, `googleMapsUri` all present on a real hit) is assumed, not verified — and a deliberately ambiguous query is the way to see whether the confirm page actually gives you enough to catch a wrong match. **Check now** is the cheap way to exercise the other Places call in the same sitting — one press proves the key, the field mask and the status parse against a real place.
-3. Seed the DB and triage the verify queue against real data. Note `restaurants.txt`
-   is 531 lines — that's 531 Text Search calls (order of $15-20) and 531 rows to
-   verify by hand, so trim it or build a bulk-verify action first. `data/restaurants.db` exists but holds 0 rows, so the dashboard has only ever been rendered against fixtures — and a full `restaurants.txt` is also the first real test of whether clicking through a long pending list is tolerable, or whether it needs a "verify all" escape hatch.
+2. **Work down the verify queue: 298 of the 505 seeded rows are still waiting**, and
+   `run_check` skips every one of them, so the tool is currently watching 207
+   restaurants rather than the list. The Text Search spend is already made, so what's
+   left is hand-triage at the pace of the last three sittings — or a bulk-verify
+   action, if that pace stops being tolerable before the queue empties.
+3. **Run the scheduler against the real list.** Only seven rows have ever been
+   checked, all by hand, all `OPERATIONAL` — so the serial loop has never run at
+   real length, the news check has never fired against a real restaurant, and no
+   status transition has ever been observed end to end. `data/.run_count` is still
+   at 1. This is where the per-run cost and wall-clock time of 200+ restaurants
+   become real numbers rather than estimates, and it's the natural companion to
+   step 1: the first genuine alert will come from here.
 4. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
