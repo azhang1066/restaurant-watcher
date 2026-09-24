@@ -6,7 +6,8 @@ open work only; finished items (HTTP retries everywhere including the Anthropic 
 the test suite, email notifications, log pruning, call-time config, `run_check`
 coverage, the notify-on-transition fixes, the ntfy emoji-title bug, Phase 2's
 read-only view, re-activate action, add-a-restaurant flow, verification gate, delete
-action and on-demand check, and the real-key pass over both Places calls) are dropped
+action and on-demand check, the real-key pass over both Places calls, and ntfy
+delivery confirmed on a real phone after the emoji-title fix) are dropped
 once done — see git history for what landed._
 
 _Phase 2 is finished apart from auth. Every routine action now has a button; the only
@@ -292,17 +293,17 @@ thing is still open, and it's the one that gates everything else:
 - Per-restaurant check cadence instead of one global schedule (e.g. check closing-soon news more often for restaurants already flagged once).
 
 ## 4. Concrete Next Steps (start of next session)
-1. **Confirm an alert actually arrives on the phone.** The emoji-title bug means no ntfy notification this tool has ever sent can have been delivered — `run_check` caught the `UnicodeEncodeError` inside the per-restaurant `except` and logged it as a failed check. Worth one deliberate `notify()` against the real topic to prove the fix end to end, since every test fakes the POST.
-2. **Work down the verify queue: 298 of the 505 seeded rows are still waiting**, and
+1. **Work down the verify queue: 298 of the 505 seeded rows are still waiting**, and
    `run_check` skips every one of them, so the tool is currently watching 207
    restaurants rather than the list. The Text Search spend is already made, so what's
    left is hand-triage at the pace of the last three sittings — or a bulk-verify
    action, if that pace stops being tolerable before the queue empties.
-3. **Run the scheduler against the real list.** Only seven rows have ever been
+2. **Run the scheduler against the real list.** Only seven rows have ever been
    checked, all by hand, all `OPERATIONAL` — so the serial loop has never run at
    real length, the news check has never fired against a real restaurant, and no
    status transition has ever been observed end to end. `data/.run_count` is still
    at 1. This is where the per-run cost and wall-clock time of 200+ restaurants
-   become real numbers rather than estimates, and it's the natural companion to
-   step 1: the first genuine alert will come from here.
-4. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
+   become real numbers rather than estimates. ntfy delivery itself is proven (a
+   push reached the phone on 2026-09-24), so the first genuine alert from here
+   tests the transition logic, not the pipe.
+3. Decide Resy/OpenTable scope for Phase 1 (which platform first, what auth approach) — still the biggest unknown and worth a short spike before committing to a design.
