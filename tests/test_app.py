@@ -739,6 +739,92 @@ def test_verify_404s_for_an_unknown_restaurant(client):
     assert _post_verify(client, 999).status_code == 404
 
 
+def _post_verify_selected(client, ids, token=None, follow_redirects=False):
+    data = {"csrf_token": _csrf(client) if token is None else token, "ids": ids}
+    return client.post("/verify-selected", data=data,
+                       follow_redirects=follow_redirects)
+
+
+def test_bulk_verify_verifies_only_the_selected_rows(client):
+    a = _add("Lilia", "place-lilia", verified=False)
+    b = _add("Carbone", "place-carbone", verified=False)
+    c = _add("Via Carota", "place-carota", verified=False)
+
+    body = _post_verify_selected(client, [a, c],
+                                 follow_redirects=True).get_data(as_text=True)
+
+    assert db.get_restaurant(a)["verified_at"] is not None
+    assert db.get_restaurant(b)["verified_at"] is None
+    assert db.get_restaurant(c)["verified_at"] is not None
+    assert "Verified 2 restaurants" in body
+
+
+def test_bulk_verify_touches_only_verified_at(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    before = db.get_restaurant(restaurant_id)
+
+    _post_verify_selected(client, [restaurant_id])
+
+    after = db.get_restaurant(restaurant_id)
+    assert {k: v for k, v in after.items() if k != "verified_at"} == \
+           {k: v for k, v in before.items() if k != "verified_at"}
+
+
+def test_bulk_verify_counts_only_rows_that_changed(client):
+    fresh = _add("Lilia", "place-lilia", verified=False)
+    done = _add("Carbone", "place-carbone", verified=True)
+    stamp = db.get_restaurant(done)["verified_at"]
+
+    body = _post_verify_selected(client, [fresh, done, 999],
+                                 follow_redirects=True).get_data(as_text=True)
+
+    assert "Verified 1 restaurant " in body
+    assert db.get_restaurant(done)["verified_at"] == stamp
+
+
+def test_bulk_verify_with_nothing_selected_changes_nothing(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    body = client.post("/verify-selected", data={"csrf_token": _csrf(client)},
+                       follow_redirects=True).get_data(as_text=True)
+
+    assert "Tick at least one" in body
+    assert db.get_restaurant(restaurant_id)["verified_at"] is None
+
+
+def test_bulk_verify_ignores_malformed_ids(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = _post_verify_selected(client, ["abc", str(restaurant_id), ""])
+
+    assert response.status_code == 302
+    assert db.get_restaurant(restaurant_id)["verified_at"] is not None
+
+
+def test_bulk_verify_requires_a_csrf_token(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+
+    response = _post_verify_selected(client, [restaurant_id], token="wrong")
+
+    assert response.status_code == 400
+    assert db.get_restaurant(restaurant_id)["verified_at"] is None
+
+
+def test_bulk_verify_is_unreachable_by_get(client):
+    assert client.get("/verify-selected").status_code == 405
+
+
+def test_index_offers_a_checkbox_per_unverified_row_and_none_otherwise(client):
+    pending = _add("Lilia", "place-lilia", verified=False)
+    _add("Carbone", "place-carbone", verified=True)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert body.count('name="ids"') == 1
+    assert f'value="{pending}"' in body
+    assert "Verify selected" in body
+
+
 def test_reject_deletes_the_restaurant_and_its_history(client):
     restaurant_id = _add("Lilia", "place-lilia", verified=False)
     db.update_check_result(restaurant_id, "OPERATIONAL", False, "")

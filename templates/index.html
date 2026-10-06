@@ -32,9 +32,21 @@
         beside it, so a wrong match looks just like a right one. These aren't
         being checked at all until you confirm each is the place you meant.
       </p>
+      {#- The checkboxes sit in the list below and join this form through their
+          `form` attribute: nesting it around the list would nest it around
+          each row's own verify/reject forms, which HTML doesn't allow. -#}
+      <form id="bulk-verify" class="bulk" method="post"
+            action="{{ url_for('verify_selected') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label><input type="checkbox" id="select-all"> Select all</label>
+        <button class="action" type="submit">Verify selected</button>
+        <span class="muted small">Only tick the ones whose address you've checked.</span>
+      </form>
       <ul>
         {% for r in pending %}
           <li>
+            <input type="checkbox" name="ids" value="{{ r.id }}" form="bulk-verify"
+                   class="pick" aria-label="Select {{ r.name }}">
             <a class="name" href="{{ url_for('detail', restaurant_id=r.id) }}">{{ r.name }}</a>
             {% if r.address %}<div class="muted small">{{ r.address }}</div>{% endif %}
             {% if r.maps_url %}
@@ -46,6 +58,22 @@
         {% endfor %}
       </ul>
     </div>
+    <script>
+      (function () {
+        var all = document.getElementById("select-all");
+        var form = document.getElementById("bulk-verify");
+        var picks = document.querySelectorAll("input.pick");
+        all.addEventListener("change", function () {
+          picks.forEach(function (p) { p.checked = all.checked; });
+        });
+        form.addEventListener("submit", function (e) {
+          var n = document.querySelectorAll("input.pick:checked").length;
+          if (n && !confirm("Confirm that " + n + " restaurant" + (n === 1 ? " is" : "s are") + " the right place?")) {
+            e.preventDefault();
+          }
+        });
+      })();
+    </script>
   {% endif %}
 
   {#- The one form on this site that costs money, so it says so, and it

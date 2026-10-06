@@ -98,6 +98,10 @@
     .pending ul { list-style: none; margin: .75rem 0 0; padding: 0; }
     .pending li { padding: .6rem 0; border-top: 1px solid var(--line); }
     .pending li:first-child { border-top: 0; padding-top: 0; }
+    .pending li { display: grid; grid-template-columns: auto 1fr; column-gap: .6rem; }
+    .pending li > :not(input.pick) { grid-column: 2; }
+    .pending li > input.pick { grid-row: 1 / span 4; margin-top: .3rem; }
+    .pending form.bulk { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: .75rem 0 0; }
     .summary-text { margin: .2rem 0 0; max-width: 34rem; }
     @media (max-width: 40rem) {
       th, td { padding: .5rem .6rem; }

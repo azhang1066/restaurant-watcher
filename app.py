@@ -9,6 +9,7 @@ file by hand. This serves:
                                  db.unarchive_restaurant for the caveat)
     /restaurant/<id>/verify      POST: confirm this is the right place
     /restaurant/<id>/reject      POST: it wasn't -- delete it and search again
+    /verify-selected             POST: verify every ticked row on the index
     /restaurant/<id>/check       POST: re-poll Places for this one, now
     /restaurant/<id>/delete      POST: stop watching it -- delete row + history
     /add                         POST: search Google Places for a name
@@ -75,7 +76,8 @@ from flask import (Flask, abort, flash, redirect, render_template, request,
 
 from db import (add_restaurant, check_history, delete_restaurant,
                 get_restaurant, get_restaurant_by_place_id, init_db,
-                list_restaurants, unarchive_restaurant, verify_restaurant)
+                list_restaurants, unarchive_restaurant, verify_restaurant,
+                verify_restaurants)
 from places_client import find_place_id, place_summary
 # The dashboard runs the same check the scheduler does rather than a second
 # implementation of it -- see main.check_one. main has no import-time work
@@ -456,6 +458,37 @@ def create_app():
         flash(f"Verified {restaurant['name']} \u2014 the next check will "
               "include it.", "info")
         return _back_to(restaurant_id)
+
+    @app.post("/verify-selected")
+    def verify_selected():
+        """Yes, those are all the right places -- for every ticked row at once.
+
+        Only ever writes `verified_at`, through the same once-only UPDATE the
+        single-row route uses, so ids that are unknown, already verified or
+        just malformed are skipped rather than failing the batch. The count in
+        the flash is the number that actually changed, not the number posted.
+        """
+        _require_csrf()
+        ids = []
+        for raw in request.form.getlist("ids"):
+            try:
+                ids.append(int(raw))
+            except ValueError:
+                continue
+        if not ids:
+            flash("Tick at least one restaurant to verify.", "warn")
+            return redirect(url_for("index"))
+
+        changed = verify_restaurants(ids)
+        logger.info("Bulk-verified %d of %d selected restaurants (ids=%s)",
+                    changed, len(ids), sorted(set(ids)))
+        if changed:
+            flash(f"Verified {changed} restaurant{'s' if changed != 1 else ''}"
+                  " — the next check will include "
+                  f"{'them' if changed != 1 else 'it'}.", "info")
+        else:
+            flash("Those were already verified.", "info")
+        return redirect(url_for("index"))
 
     @app.post("/restaurant/<int:restaurant_id>/reject")
     def reject(restaurant_id):

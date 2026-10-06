@@ -215,6 +215,24 @@ def verify_restaurant(restaurant_id):
     return changed > 0
 
 
+def verify_restaurants(restaurant_ids):
+    """Verify several rows in one transaction. Returns how many were newly
+    verified; ids that are unknown or already verified are skipped, exactly as
+    verify_restaurant() skips them one at a time."""
+    ids = [(i,) for i in restaurant_ids]
+    if not ids:
+        return 0
+    with get_conn() as conn:
+        changed = 0
+        for params in ids:
+            changed += conn.execute(
+                """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND verified_at IS NULL""",
+                params,
+            ).rowcount
+    return changed
+
+
 def delete_restaurant(restaurant_id):
     """Remove a restaurant and everything logged about it. Returns True if a
     row went, False if there was no such restaurant.
