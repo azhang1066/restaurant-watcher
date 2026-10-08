@@ -1,7 +1,7 @@
 # Restaurant Watcher — Working Plan
 
-_Last reviewed: 2026-09-20, against 14 commits through `cef4211` ("Updating docs"),
-tree clean. The tests are comfortably the largest part of the repo. This plan tracks
+_Last reviewed: 2026-10-07, against 18 commits through `3daac65`
+("Fixing tech debt"). The tests are comfortably the largest part of the repo. This plan tracks
 open work only; finished items (HTTP retries everywhere including the Anthropic SDK,
 the test suite, email notifications, log pruning, call-time config, `run_check`
 coverage, the notify-on-transition fixes, the ntfy emoji-title bug, the dashboard's
@@ -219,7 +219,7 @@ had a doubled `\\u2014` escape and rendered the six literal characters on screen
 `test_reject_flash_renders_its_em_dash` now pins the dash *and* the absence of the
 escape.
 
-186 tests, all passing (`app` 106, `main` 34, `db` 19, `notifier` 12, `closure_checker` 8,
+191 tests, all passing (`app` 106, `main` 34, `db` 24, `notifier` 12, `closure_checker` 8,
 `places_client` 4, `seed` 3). The HTTP halves of `places_client.py` remain uncovered — faking
 `requests` there would only assert the mock. `tests/test_seed.py` covers
 seed.py's wiring rather than its network half: that it loads `.env` at import

@@ -87,10 +87,8 @@ def _migrate_1_add_verified_at(conn):
     already being watched.
 
     Unverified rows are skipped by run_check, so treating a restaurant that
-    has been checked for months as suddenly unverified would silently stop
-    watching it -- and there is nothing new to tell the user about a place
-    they have been reading alerts about. Never-checked rows keep the NULL and
-    get asked about, which is exactly the new behaviour.
+    has been checked for months as unverified would silently stop watching
+    it. Never-checked rows keep the NULL and get asked about.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")}
     if "verified_at" in columns:
@@ -148,11 +146,10 @@ def init_db():
             _migrate(conn)
         conn.executescript(INDEXES)
         # Settle any closing-soon flag left set on a permanently closed row.
-        # main.run_check() clears the flag as the closure lands, but rows
-        # written before it did that are unreachable by it: a permanent
-        # closure archives, and archived rows are never checked again. Cheap
-        # and idempotent, so it just runs every time rather than needing a
-        # migration to track.
+        # checker.check_one() clears the flag as the closure lands, but a row
+        # written by anything else is unreachable by it: a permanent closure
+        # archives, and archived rows are never checked again. Cheap and
+        # idempotent, so it just runs every time.
         conn.execute(
             """UPDATE restaurants SET closing_soon_flag = 0
                WHERE business_status = ? AND closing_soon_flag = 1""",
@@ -241,7 +238,7 @@ def unarchive_restaurant(restaurant_id):
     again, and writing an optimistic OPERATIONAL here would make the next
     run read a status change and re-fire a closure alert already sent.
 
-    Note the interaction with main.run_check(), which archives on the status
+    Note the interaction with checker.check_one(), which archives on the status
     itself rather than on the transition: if Places still reports
     CLOSED_PERMANENTLY, the next run re-archives this row (quietly -- the
     status hasn't changed, so nothing notifies). Un-archiving is for a place

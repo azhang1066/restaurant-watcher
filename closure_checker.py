@@ -2,7 +2,7 @@
 signals that a restaurant is closing soon -- a lease ending, an owner
 announcement, local press coverage, etc. This is a judgment call, not a
 hard API field, so it's run less often than the Places status check
-(e.g. monthly, not weekly) to keep cost and noise down.
+(every CLOSING_SOON_CHECK_EVERY runs) to keep cost and noise down.
 """
 import json
 import os
@@ -50,7 +50,7 @@ def _client():
 
 def check_closing_soon(name, address):
     """Raises if the API is still failing once the SDK's retries are spent --
-    `main.run_check` decides what a dead news check means for the run."""
+    `checker.check_one`'s caller decides what a dead news check means for the run."""
     resp = _client().messages.create(
         model=_model(),
         max_tokens=500,

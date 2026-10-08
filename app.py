@@ -1,7 +1,4 @@
-"""Dashboard over the watcher's state (Phase 2).
-
-Until now the only way to see what the watcher knew was to open the SQLite
-file by hand. This serves:
+"""Dashboard over the watcher's state.
 
     /                            every restaurant, current status, last checked
     /restaurant/<id>             one restaurant, plus its per-month history
@@ -16,49 +13,39 @@ file by hand. This serves:
     /add/confirm                 GET: show the match, POST: track it
 
 Every read goes through `db.py` rather than issuing its own SQL, so the
-numbers here can't drift from the values `main.py` decides notifications on.
-Of the manual actions, adding and un-archiving are wired up; "force a check
-now" still needs `main.py`'s loop split up before a request can drive it.
+numbers here can't drift from the values the scheduler decides notifications on.
 
-Adding is the one thing here that spends money -- a Places Text Search per
-search -- and the one thing that can be silently *wrong*: Text Search always
-answers with its single best guess, so tracking the wrong "Lilia" looks
-exactly like tracking the right one. Hence the two steps: the search stashes
-its candidate and redirects, and a second, separate POST is what writes the
-row. The redirect in between also means a reload of the confirm page re-reads
-the stash rather than re-running (and re-paying for) the search.
+Adding spends money -- a Places Text Search per search -- and can be silently
+*wrong*: Text Search always answers with its single best guess, so tracking the
+wrong "Lilia" looks exactly like tracking the right one. Hence two steps: the
+search stashes its candidate and redirects, and a separate POST writes the row.
+The redirect also means reloading the confirm page re-reads the stash rather
+than re-running (and re-paying for) the search.
 
-Verifying is the same question the confirm page asks, asked late instead of
-early: seed.py resolves a whole file of names to place_ids with nobody
-looking at any of them, and main.run_check refuses to check a restaurant
-until someone has said yes. Rows added *through* the confirm page are stored
-already verified -- that page is the yes -- so this only ever asks about
-places nobody has actually looked at. Saying no deletes the row outright
-rather than archiving it, because its history describes a different
-restaurant; the search box is re-opened with the name filled in.
+Verifying is the same question asked late: seed.py resolves a whole file of
+names with nobody looking, and the scheduler refuses to check a restaurant
+until someone has said yes. Rows added through the confirm page are stored
+already verified, so this only asks about places nobody has looked at. Saying
+no deletes the row rather than archiving it, because its history describes a
+different restaurant, and re-opens the search with the name filled in.
 
-Checking now is the one action that spends anything, so it is scoped to the
-cheap half: it re-polls Google Places for a single restaurant and leaves the
-Claude news check on the weekly schedule, where a 120-second timeout is
-nobody's problem. See check_now().
+Checking now is scoped to the cheap half: it re-polls Google Places for one
+restaurant and leaves the Claude news check on the weekly schedule, where its
+120-second timeout is nobody's problem. See check_now().
 
-Deleting is the same removal offered for its own sake, from the list itself:
-somewhere you simply don't want watched any more. It's the only destructive
-button that will touch a restaurant whose history is real, so it's the only
-one that asks the browser to confirm first. Archiving stays the softer
-option, and is what a closure triggers on its own -- the row and its months
-of history stay on the page, greyed out.
+Deleting is the only destructive button that touches a restaurant whose history
+is real, so it's the only one that asks the browser to confirm first. Archiving
+is the softer option, and what a closure triggers on its own: the row and its
+history stay on the page, greyed out.
 
-Because there is now a state-changing route, every form carries a CSRF token
-tied to the session -- see `_csrf_token()`. That needs a signing key, so set
-`DASHBOARD_SECRET_KEY` in `.env` to keep sessions across restarts; without
-one a per-process key is generated and the only cost is that an open tab's
-token stops matching when the server restarts.
+Every state-changing form carries a CSRF token tied to the session -- see
+`_csrf_token()`. That needs a signing key, so set `DASHBOARD_SECRET_KEY` in
+`.env` to keep sessions across restarts; without one a per-process key is
+generated and an open tab's token stops matching when the server restarts.
 
 There's deliberately no module-level `app`: Flask's loader finds the
-`create_app()` factory by name, and building the app at import time would
-run `init_db()` against the real database just for importing this module
-(the tests import it).
+`create_app()` factory by name, and building the app at import time would run
+`init_db()` against the real database just for importing this module.
 
 Run it:
     flask --app app run     # http://127.0.0.1:5000
@@ -185,7 +172,7 @@ def _query_label(name, hint):
 
 def _is_checkable(restaurant):
     """Whether a scheduled run would check this row: verified and not
-    archived, exactly what main.run_check's split selects.
+    archived, exactly what a scheduled run's split selects.
 
     One definition with two callers -- _view() decides whether to offer the
     Check-now button, check_now() decides whether to honour the POST. Spelled
@@ -205,7 +192,7 @@ def _view(restaurant, now):
     checked_at = _parse_ts(restaurant.get("last_checked_at"))
     closing_soon = bool(restaurant["closing_soon_flag"])
     archived = bool(restaurant["archived"])
-    # Exactly the rows main.run_check() skips, so what the page calls "needs
+    # Exactly the rows a scheduled run skips, so what the page calls "needs
     # verifying" and what actually goes unchecked can't drift apart: that
     # loop only ever looks at unarchived rows.
     needs_verification = not restaurant.get("verified_at") and not archived
@@ -220,9 +207,9 @@ def _view(restaurant, now):
         # A closing-soon flag is news about a *future* closure, so it stops
         # being news once the place is shut for good. Decided here rather than
         # in the template so the badge and the summary count can't disagree
-        # about what the page is showing. main.run_check() now settles the
-        # stored flag on a permanent closure too, so this is belt-and-braces
-        # -- it keeps the page honest about a row written by anything else.
+        # about what the page is showing. checker.check_one() clears the
+        # stored flag on a permanent closure too; this keeps the page honest
+        # about a row written by anything else.
         "closing_soon_current": closing_soon and status != CLOSED_PERMANENTLY,
         "closing_soon_summary": restaurant.get("closing_soon_summary") or "",
         "archived": archived,
@@ -230,8 +217,8 @@ def _view(restaurant, now):
         "needs_verification": needs_verification,
         # The schema defaults business_status to OPERATIONAL, so an unchecked
         # row would otherwise render as a confident "Open" for a place nobody
-        # has ever looked up -- and now indefinitely, since an unverified one
-        # is never checked at all.
+        # has ever looked up -- indefinitely, since an unverified one is
+        # never checked at all.
         "status_known": checked_at is not None,
         # Whether to offer the Check-now button. Decided here, not in the
         # template, so it and the route's guard read the same rule.
@@ -255,10 +242,9 @@ def _sort_key(view):
 
 # --- routes ---------------------------------------------------------------
 #
-# Plain module-level functions, registered onto the app by create_app(). They
-# used to be closures inside it, which made one 380-line function out of the
-# whole dashboard. A Blueprint would have prefixed every endpoint name and so
-# broken every url_for("index") in the templates; this keeps the names.
+# Plain module-level functions, registered onto the app by create_app(). Not
+# a Blueprint: that would prefix every endpoint name and break the
+# url_for("index") calls in the templates.
 
 _ROUTES = []
 
@@ -450,7 +436,7 @@ def delete(restaurant_id):
 
 @_route("/restaurant/<int:restaurant_id>/verify", methods=("POST",))
 def verify(restaurant_id):
-    """Yes, that's the place. From here on run_check will check it."""
+    """Yes, that's the place. From here on the scheduled run will check it."""
     _require_csrf()
     restaurant = get_restaurant(restaurant_id)
     if restaurant is None:

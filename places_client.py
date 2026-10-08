@@ -23,7 +23,7 @@ def _api_key():
 
 def find_place_id(name, address_hint=""):
     """Resolve a restaurant name (+ optional address/neighborhood) to a place_id
-    via Text Search. Used once, at seed time, per restaurant."""
+    via Text Search. Used by seed.py and the dashboard's add form."""
     url = f"{PLACES_BASE}/places:searchText"
     headers = {
         "Content-Type": "application/json",

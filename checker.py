@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 def check_one(r, include_news_check=False):
     """Check one restaurant, write the result, and alert or archive on it.
 
-    Lifted out of run_check's loop so the dashboard's "Check now" button and
-    the scheduled run share one implementation. The parts worth not
+    Shared by run_check's loop and the dashboard's "Check now" button, so
+    there is one implementation of both. The parts worth not
     duplicating are the subtle ones: when an alert fires (a move *into* a
     closed status, not merely a closed status), when the closing-soon flag is
     carried forward rather than cleared, and when a row gets archived. A
