@@ -26,7 +26,7 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 
-from checker import check_one
+from checker import check_one, is_checkable
 from db import DEFAULT_RETAIN_DAYS, init_db, list_restaurants, prune_check_log
 from notifier import notify_needs_verification
 
@@ -52,20 +52,31 @@ def _check_log_retain_days():
     return int(os.environ.get("CHECK_LOG_RETAIN_DAYS") or DEFAULT_RETAIN_DAYS)
 
 
-def _next_run_count():
-    count = 0
-    if os.path.exists(_run_count_file):
-        count = int(open(_run_count_file).read().strip() or 0)
-    count += 1
+def _read_run_count():
+    """Completed runs so far. A missing, empty or corrupt file reads as 0:
+    losing the count only shifts when the next news check falls due."""
+    try:
+        with open(_run_count_file) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_run_count(count):
+    """Atomic: write a sibling file, then replace, so a crash mid-write can't
+    leave a truncated counter behind."""
     os.makedirs(os.path.dirname(_run_count_file), exist_ok=True)
-    with open(_run_count_file, "w") as f:
+    tmp = _run_count_file + ".tmp"
+    with open(tmp, "w") as f:
         f.write(str(count))
-    return count
+    os.replace(tmp, _run_count_file)
 
 
 def run_check(include_news_check=None):
     init_db()
-    run_count = _next_run_count()
+    # Only recorded once the run has finished (see the end of this function),
+    # so a run that dies partway doesn't advance the news-check cadence.
+    run_count = _read_run_count() + 1
     if include_news_check is None:
         include_news_check = (run_count % _closing_soon_check_every() == 0)
 
@@ -74,7 +85,7 @@ def run_check(include_news_check=None):
     # that got skipped.
     active = list_restaurants(active_only=True)
     unverified = [r for r in active if not r["verified_at"]]
-    restaurants = [r for r in active if r["verified_at"]]
+    restaurants = [r for r in active if is_checkable(r)]
     logger.info("Checking %d restaurants (news check: %s%s)",
                 len(restaurants), "on" if include_news_check else "off",
                 f", {len(unverified)} unverified and skipped" if unverified else "")
@@ -106,6 +117,12 @@ def run_check(include_news_check=None):
         except Exception:
             # Housekeeping only -- never fail a run whose checks already landed.
             logger.exception("check_log pruning failed -- continuing")
+
+    try:
+        _write_run_count(run_count)
+    except OSError:
+        logger.exception("Couldn't record the run count -- the news-check "
+                         "cadence won't advance this run")
 
     logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
     if unverified:

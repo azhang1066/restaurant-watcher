@@ -14,6 +14,13 @@ from statuses import CLOSED_PERMANENTLY, CLOSED_STATUSES, OPERATIONAL
 logger = logging.getLogger(__name__)
 
 
+def is_checkable(restaurant):
+    """Whether a scheduled run would check this row: verified and not
+    archived. The one definition -- run_check, check_one and the dashboard's
+    Check-now button all read it, so they can't disagree."""
+    return bool(restaurant.get("verified_at")) and not restaurant["archived"]
+
+
 def check_one(r, include_news_check=False):
     """Check one restaurant, write the result, and alert or archive on it.
 
@@ -35,11 +42,24 @@ def check_one(r, include_news_check=False):
     off the stored flag is carried forward untouched, exactly as on a plain
     run.
 
+    Refuses a row a scheduled run would skip (unverified or archived) with a
+    ValueError, so the rule lives here rather than only in each caller's
+    pre-filter -- see `is_checkable`.
+
+    The alert goes out *before* the result is written. If ntfy is down the
+    exception propagates with the row untouched, so the next run sees the same
+    transition and tries the alert again. Written first, the transition would
+    already be recorded by then and the alert lost for good. The cost is a
+    possible duplicate alert if the write itself fails after a send.
+
     Returns the new status, the closing-soon flag as written, and whether a
     news check was attempted and failed. Whatever the Places call raises
     propagates: the caller knows whether that's one row of many or the whole
     of what it was asked to do.
     """
+    if not is_checkable(r):
+        raise ValueError(f"{r['name']} (id={r['id']}) is unverified or archived "
+                         "and isn't checked")
     status = get_business_status(r["place_id"])
 
     # Carry the stored flag forward: only a news check can change it,
@@ -75,8 +95,6 @@ def check_one(r, include_news_check=False):
     if status == CLOSED_PERMANENTLY:
         closing_soon = False
 
-    update_check_result(r["id"], status, closing_soon, summary)
-
     # Notify on any move *into* a closed status, not just from
     # OPERATIONAL -- temporarily-closed places close for good too.
     status_changed = status != r["business_status"]
@@ -84,6 +102,8 @@ def check_one(r, include_news_check=False):
         notify_closed(r, status)
     elif closing_soon and not r["closing_soon_flag"]:
         notify_closing_soon(r, summary)
+
+    update_check_result(r["id"], status, closing_soon, summary)
 
     # Archive on the status itself rather than on the transition, so a
     # place that reached CLOSED_PERMANENTLY by some path that skipped

@@ -518,9 +518,9 @@ def test_failure_is_logged_with_a_traceback(tmp_path, monkeypatch, caplog):
 
 
 def test_notifier_failure_does_not_abort_the_run(tmp_path, monkeypatch):
-    """The status write lands before the notify call, so a dead ntfy leaves
-    the DB correct -- and the next run won't retry the alert, since the
-    transition is already recorded."""
+    """A dead ntfy fails that one restaurant's check and leaves its row
+    untouched -- so the next run sees the same transition and retries the
+    alert -- while the others are still checked."""
     _setup(tmp_path, monkeypatch, restaurants=(
         ("Lilia", "place-lilia"),
         ("Don Angie", "place-angie"),
@@ -534,8 +534,47 @@ def test_notifier_failure_does_not_abort_the_run(tmp_path, monkeypatch):
 
     main.run_check(include_news_check=False)  # must not raise
 
-    assert _row("Lilia")["business_status"] == "CLOSED_TEMPORARILY"
+    assert _row("Lilia")["business_status"] == "OPERATIONAL"
+    assert _row("Lilia")["last_checked_at"] is None
     assert _row("Don Angie")["last_checked_at"] is not None
+
+    # ntfy recovers: the closure is announced on the next run.
+    closed, _ = _patch_notifiers(monkeypatch)
+    main.run_check(include_news_check=False)
+    assert closed == [("Lilia", "CLOSED_TEMPORARILY")]
+    assert _row("Lilia")["business_status"] == "CLOSED_TEMPORARILY"
+
+
+def test_a_crashed_run_does_not_advance_the_run_counter(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch)
+    monkeypatch.setattr(main, "list_restaurants",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    try:
+        main.run_check()
+    except RuntimeError:
+        pass
+
+    assert main._read_run_count() == 0
+
+
+def test_a_corrupt_run_counter_reads_as_zero(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    (tmp_path / ".run_count").write_text("not a number")
+
+    assert main._read_run_count() == 0
+
+
+def test_check_one_refuses_unverified_and_archived_rows(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, verified=False)
+    calls = _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    import pytest
+    with pytest.raises(ValueError):
+        checker.check_one(_row("Lilia"))
+    assert calls == []
 
 
 # --- housekeeping -------------------------------------------------------

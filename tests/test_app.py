@@ -1227,7 +1227,7 @@ def test_check_now_leaves_the_run_counter_alone(client, monkeypatch):
     restaurant_id = _add("Lilia", "place-lilia")
     _patch_check(monkeypatch)
     counted = []
-    monkeypatch.setattr(main, "_next_run_count", lambda: counted.append(1) or 1)
+    monkeypatch.setattr(main, "_write_run_count", lambda n: counted.append(n))
 
     _post_check(client, restaurant_id)
 
@@ -1358,3 +1358,28 @@ def test_check_button_round_trips_a_token_from_the_rendered_page(client, monkeyp
     client.post(f"/restaurant/{restaurant_id}/check", data={"csrf_token": token})
 
     assert places == ["place-lilia"]
+
+
+def test_logging_is_configured_when_nothing_has(monkeypatch):
+    """`flask run` leaves the root logger without a handler, which drops
+    every logger.info() in this module -- including the secret-key warning."""
+    import logging
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    calls = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: calls.append(kw))
+
+    dashboard._configure_logging()
+
+    assert calls and calls[0]["level"] == logging.INFO
+
+
+def test_existing_logging_is_left_alone(monkeypatch):
+    import logging
+    monkeypatch.setattr(logging.getLogger(), "handlers", [logging.NullHandler()])
+    calls = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: calls.append(kw))
+
+    dashboard._configure_logging()
+
+    assert calls == []

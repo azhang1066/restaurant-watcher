@@ -1,0 +1,12 @@
+# Dependencies are pinned exactly (requirements*.txt), so nothing moves unless
+# something changes the pin. This opens one PR a week per bump; the test suite
+# is the gate for merging it.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]

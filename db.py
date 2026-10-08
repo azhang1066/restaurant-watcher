@@ -1,9 +1,12 @@
 """SQLite storage for tracked restaurants and their check history."""
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
 from statuses import ALL_STATUSES, CLOSED_PERMANENTLY, OPERATIONAL
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "data" / "restaurants.db"
 
@@ -69,12 +72,23 @@ CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
 
 DEFAULT_RETAIN_DAYS = 90
 
+# The dashboard and the scheduler are separate processes sharing one file.
+# Wait this long for the other's write lock instead of failing at once with
+# "database is locked" (sqlite3's default is 5 seconds, which a prune can exceed).
+BUSY_TIMEOUT_SECONDS = 30
+
 
 @contextmanager
 def get_conn():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    # WAL lets the dashboard read while the scheduler writes. The mode is
+    # stored in the database file, so this is a no-op after the first time.
+    conn.execute("PRAGMA journal_mode = WAL")
+    # Off by default and per-connection: without it the REFERENCES clauses in
+    # SCHEMA are documentation, not constraints.
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -125,12 +139,34 @@ SCHEMA_VERSION = len(_MIGRATIONS)
 def _migrate(conn):
     """Bring an existing database up to SCHEMA_VERSION."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    for number in range(version + 1, SCHEMA_VERSION + 1):
-        conn.execute("BEGIN")
-        _MIGRATIONS[number - 1](conn)
-        # PRAGMA doesn't take parameters; `number` is an int we control.
-        conn.execute(f"PRAGMA user_version = {number}")
-        conn.execute("COMMIT")
+    if version >= SCHEMA_VERSION:
+        return
+    # Rebuilding `restaurants` (migration 2) drops a table the log tables
+    # reference, which enforcement would refuse. The pragma is a no-op inside
+    # a transaction, so it is switched off here, before the first BEGIN, and
+    # back on once the last migration has committed.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        for number in range(version + 1, SCHEMA_VERSION + 1):
+            conn.execute("BEGIN")
+            try:
+                _MIGRATIONS[number - 1](conn)
+                # PRAGMA doesn't take parameters; `number` is an int we control.
+                conn.execute(f"PRAGMA user_version = {number}")
+            except BaseException:
+                # Explicit rather than left to conn.close(): the half-applied
+                # migration must not be committed by get_conn's own commit.
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        orphans = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if orphans:
+            # Rows that predate enforcement. Reported, not fixed: guessing
+            # which side to delete is the user's call.
+            logger.warning("%d row(s) reference a restaurant that doesn't exist "
+                           "(PRAGMA foreign_key_check).", len(orphans))
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def init_db():

@@ -19,6 +19,11 @@ pip install -r requirements.txt        # runtime
 cp .env.example .env   # fill in your keys
 ```
 
+Dependencies are pinned exactly. `.github/dependabot.yml` opens a weekly PR for
+any bump; run the tests before merging one. The Claude model for the news check
+is a default in `closure_checker.py` that `CLOSURE_CHECK_MODEL` overrides, so
+when a model is retired you can switch it from `.env` without a code change.
+
 You'll need:
 - **Google Places API key** (Places API "New" enabled in Google Cloud Console)
 - **Anthropic API key** (for the closing-soon news check)

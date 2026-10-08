@@ -68,7 +68,7 @@ from db import (add_restaurant, check_history, delete_restaurant,
 from places_client import find_place_id, place_summary
 # The dashboard runs the same check the scheduler does rather than a second
 # implementation of it -- see checker.check_one.
-from checker import check_one
+from checker import check_one, is_checkable
 from statuses import (CLOSED_PERMANENTLY, CLOSED_STATUSES, CLOSED_TEMPORARILY,
                       OPERATIONAL)
 
@@ -170,18 +170,6 @@ def _query_label(name, hint):
     return f"{name} {hint}".strip() if hint else name
 
 
-def _is_checkable(restaurant):
-    """Whether a scheduled run would check this row: verified and not
-    archived, exactly what a scheduled run's split selects.
-
-    One definition with two callers -- _view() decides whether to offer the
-    Check-now button, check_now() decides whether to honour the POST. Spelled
-    out twice they would eventually disagree, and the way that shows up is a
-    button on the page that answers 400.
-    """
-    return bool(restaurant.get("verified_at")) and not restaurant["archived"]
-
-
 def _view(restaurant, now):
     """Presentation-ready copy of a restaurant row.
 
@@ -222,7 +210,7 @@ def _view(restaurant, now):
         "status_known": checked_at is not None,
         # Whether to offer the Check-now button. Decided here, not in the
         # template, so it and the route's guard read the same rule.
-        "checkable": _is_checkable(restaurant),
+        "checkable": is_checkable(restaurant),
         "checked_at": checked_at,
         "checked_age": _age(checked_at, now),
         # Never checked is its own state, not a stale one -- a freshly seeded
@@ -349,7 +337,7 @@ def check_now(restaurant_id):
     Only a news check moves that flag, and news checks stay on the weekly
     schedule; the button's title says so on the page.
 
-    Scoped to the rows a scheduled run would check (`_is_checkable`), so
+    Scoped to the rows a scheduled run would check (`is_checkable`), so
     an unverified or archived restaurant is a 400 rather than a check the
     weekly run would never have made. Neither is reachable from the page
     -- this is for a stale tab or a crafted post.
@@ -358,7 +346,7 @@ def check_now(restaurant_id):
     restaurant = get_restaurant(restaurant_id)
     if restaurant is None:
         abort(404)
-    if not _is_checkable(restaurant):
+    if not is_checkable(restaurant):
         abort(400, "That restaurant isn't being checked -- verify it, or "
                    "re-activate it, first.")
 
@@ -366,13 +354,14 @@ def check_now(restaurant_id):
     try:
         result = check_one(restaurant)
     except Exception:
-        # Places was unreachable (or the key is wrong). check_one writes
-        # nothing before the fetch returns, so there's no half-applied
-        # check to explain -- say so and leave the row as it was.
+        # Places was unreachable (or the key is wrong), or the alert
+        # couldn't be sent. check_one writes nothing until both have
+        # succeeded, so there's no half-applied check to explain -- say so
+        # and leave the row as it was.
         logger.exception("Manual check failed for %s (id=%s)",
                          restaurant["name"], restaurant_id)
-        flash(f"Couldn't reach Google Places to check {restaurant['name']}"
-              " — nothing was changed.", "warn")
+        flash(f"Couldn't reach Google Places (or send the alert) to check "
+              f"{restaurant['name']} — nothing was changed.", "warn")
         return _back_to(restaurant_id)
 
     status = result["status"]
@@ -625,7 +614,18 @@ def add_commit():
     return redirect(url_for("detail", restaurant_id=added["id"]))
 
 
+def _configure_logging():
+    """Give this module's loggers somewhere to go. `flask run` only wires up
+    Flask's own logger, so without a root handler every logger.info() here --
+    the CSRF key warning, "Added ...", "Deleted ..." -- is silently dropped.
+    Left alone when a handler already exists (tests, an embedding server)."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s")
+
+
 def create_app():
+    _configure_logging()
     app = Flask(__name__)
     app.secret_key = _secret_key()
     app.jinja_env.globals["csrf_token"] = _csrf_token

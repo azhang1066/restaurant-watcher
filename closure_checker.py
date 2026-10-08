@@ -12,7 +12,7 @@ import anthropic
 # Default model and server-side tool version. Both are API identifiers that
 # get retired, so the model can be overridden from `.env` (CLOSURE_CHECK_MODEL)
 # without a code change, and the tool type has one definition to update.
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5-5"
 WEB_SEARCH_TOOL = "web_search_20250305"
 
 # The SDK runs its own retry loop (exponential backoff, honors `retry-after`,

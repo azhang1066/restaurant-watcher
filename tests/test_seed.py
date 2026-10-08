@@ -69,3 +69,71 @@ def test_a_line_with_no_match_is_skipped_not_fatal(tmp_path, monkeypatch):
     seed.seed_from_file(str(listing))
 
     assert [r["name"] for r in db.list_restaurants(active_only=False)] == ["Lilia"]
+
+
+def _place(name, place_id=None):
+    return {"id": place_id or f"place-{name.lower()}", "displayName": {"text": name},
+            "formattedAddress": "somewhere"}
+
+
+def test_a_failed_lookup_does_not_abort_the_rest_of_the_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+
+    def _find(name, hint=""):
+        if name == "Boom":
+            raise RuntimeError("places is down")
+        return _place(name)
+
+    monkeypatch.setattr(seed, "find_place_id", _find)
+    listing = tmp_path / "restaurants.txt"
+    listing.write_text("Lilia\nBoom\nDon Angie\n", encoding="utf-8")
+
+    counts = seed.seed_from_file(str(listing))
+
+    assert counts["failed"] == 1 and counts["added"] == 2
+    assert sorted(r["name"] for r in db.list_restaurants(active_only=False)) == [
+        "Don Angie", "Lilia"]
+
+
+def test_reseeding_does_not_search_for_names_already_tracked(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    searches = []
+
+    def _find(name, hint=""):
+        searches.append((name, hint))
+        return _place(name)
+
+    monkeypatch.setattr(seed, "find_place_id", _find)
+    listing = tmp_path / "restaurants.txt"
+    listing.write_text("Lilia\nLilia\nDon Angie\n", encoding="utf-8")
+
+    seed.seed_from_file(str(listing))
+    assert searches == [("Lilia", ""), ("Don Angie", "")]  # the repeat was free
+
+    searches.clear()
+    counts = seed.seed_from_file(str(listing))
+    assert searches == []
+    assert counts["existing"] == 2
+
+
+def test_a_hint_forces_a_search_even_for_a_tracked_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(seed, "find_place_id",
+                        lambda name, hint="": _place(name, f"place-{hint or 'main'}"))
+    listing = tmp_path / "restaurants.txt"
+    listing.write_text("Joe's\nJoe's, Queens\n", encoding="utf-8")
+
+    counts = seed.seed_from_file(str(listing))
+
+    assert counts["added"] == 2
+
+
+def test_a_utf8_file_with_a_bom_is_read_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(seed, "find_place_id", lambda name, hint="": _place(name))
+    listing = tmp_path / "restaurants.txt"
+    listing.write_bytes("\ufeffCafé Boulud\n".encode("utf-8"))
+
+    seed.seed_from_file(str(listing))
+
+    assert [r["name"] for r in db.list_restaurants(active_only=False)] == ["Café Boulud"]

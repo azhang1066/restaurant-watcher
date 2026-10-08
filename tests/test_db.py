@@ -348,7 +348,9 @@ def test_constraint_migration_keeps_rows_ids_and_history(tmp_path, monkeypatch):
     rid = db.get_restaurant_by_place_id("place-lilia")["id"]
     db.update_check_result(rid, "CLOSED_TEMPORARILY", True, "closing")
     with db.get_conn() as conn:
-        # Back to the unconstrained v1 table.
+        # Back to the unconstrained v1 table. Enforcement off: this swaps a
+        # table the log tables reference, as migration 2 itself does.
+        conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("ALTER TABLE restaurants RENAME TO restaurants_old")
         conn.execute("""CREATE TABLE restaurants (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
@@ -414,3 +416,21 @@ def test_a_bad_row_aborts_the_constraint_migration_and_loses_nothing(tmp_path, m
     assert _version(tmp_path) == 1
     with db.get_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM restaurants").fetchone()[0] == 1
+
+
+def test_foreign_keys_are_enforced(tmp_path, monkeypatch):
+    import sqlite3
+    import pytest
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.get_conn() as conn:
+            conn.execute("INSERT INTO check_log (restaurant_id, business_status) "
+                         "VALUES (999, 'OPERATIONAL')")
+
+
+def test_connections_use_wal(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    with db.get_conn() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
