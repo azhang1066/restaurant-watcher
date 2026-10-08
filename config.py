@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Checks run weekly by default, so this long without one means the scheduler
+# died rather than that nothing happened. Shared by the dashboard (Stale badge)
+# and the scheduler (its "I was down" push on restart).
+STALE_AFTER_DAYS = 14
+
 logger = logging.getLogger(__name__)
 
 

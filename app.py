@@ -63,7 +63,7 @@ from db import (add_restaurant, check_history, delete_restaurant,
                 get_restaurant, get_restaurant_by_place_id, init_db,
                 list_restaurants, unarchive_restaurant, verify_restaurant,
                 verify_restaurants)
-from config import configure_logging, env_str
+from config import STALE_AFTER_DAYS, configure_logging, env_str
 from places_client import PlaceNotFound, find_place_id, place_summary
 # The dashboard runs the same check the scheduler does rather than a second
 # implementation of it -- see checker.check_one.
@@ -73,10 +73,8 @@ from statuses import (CLOSED_PERMANENTLY, CLOSED_STATUSES, CLOSED_TEMPORARILY,
 
 logger = logging.getLogger(__name__)
 
-# Checks run weekly by default, so a fortnight of silence means the scheduler
-# died rather than that nothing happened. Worth surfacing: a watcher that has
-# quietly stopped watching looks exactly like one with no bad news.
-STALE_AFTER_DAYS = 14
+# STALE_AFTER_DAYS (config.py): a watcher that has quietly stopped watching
+# looks exactly like one with no bad news, so the page surfaces it.
 
 _ATTENTION_STATUSES = CLOSED_STATUSES
 

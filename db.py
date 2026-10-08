@@ -254,15 +254,20 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag,
 
     `archive` flips the archived flag in the same transaction, so a crash
     can't leave a permanently closed row recorded but still on the active list.
+
+    Returns False, writing nothing, if the row was deleted since it was read
+    (e.g. from the dashboard mid-run).
     """
     with get_conn() as conn:
-        conn.execute(
+        updated = conn.execute(
             """UPDATE restaurants
                SET business_status = ?, closing_soon_flag = ?, closing_soon_summary = ?,
                    last_checked_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
             (business_status, int(closing_soon_flag), closing_soon_summary, restaurant_id),
-        )
+        ).rowcount
+        if not updated:
+            return False
         conn.execute(
             """INSERT INTO check_log (restaurant_id, business_status, closing_soon_flag)
                VALUES (?, ?, ?)""",
@@ -270,6 +275,7 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag,
         )
         if archive:
             conn.execute("UPDATE restaurants SET archived = 1 WHERE id = ?", (restaurant_id,))
+    return True
 
 
 def archive_restaurant(restaurant_id):

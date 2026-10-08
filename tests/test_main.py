@@ -48,7 +48,7 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),),
     """
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
-    for var in ("CLOSING_SOON_CHECK_EVERY", "CHECK_LOG_RETAIN_DAYS"):
+    for var in ("CLOSING_SOON_CHECK_EVERY", "CHECK_LOG_RETAIN_DAYS", "HEALTHCHECK_URL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("BACKUPS_KEPT", raising=False)
     # Never let a failing check in these tests push to the real ntfy topic.
@@ -831,3 +831,143 @@ def test_backups_can_be_disabled(tmp_path, monkeypatch):
     main.run_check(include_news_check=False)
 
     assert not (tmp_path / "backups").exists()
+
+
+# --- run safety: lock, stale snapshot, schedule, monitoring ------------------
+
+def _patch_healthcheck(monkeypatch):
+    pings = []
+    monkeypatch.setattr(main, "ping_healthcheck", lambda ok=True: pings.append(ok))
+    return pings
+
+
+def test_a_concurrent_run_is_skipped(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    calls = _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch)
+
+    with main._run_lock():
+        main.run_check(include_news_check=False)
+
+    assert calls == []
+    assert main._read_run_count() == 0
+    # The lock is released afterwards, so the next run goes ahead.
+    main.run_check(include_news_check=False)
+    assert calls == ["place-lilia"]
+
+
+def test_a_row_deleted_mid_run_is_skipped(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "p1"), ("Don Angie", "p2")))
+    calls = _patch_places(monkeypatch, {"p1": "OPERATIONAL", "p2": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch)
+    real = checker.get_business_status
+
+    def _delete_other_during_first(place_id):
+        if place_id == "p1":
+            db.delete_restaurant(_row("Don Angie")["id"])
+        return real(place_id)
+
+    monkeypatch.setattr(checker, "get_business_status", _delete_other_during_first)
+    problems = _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert calls == ["p1"]
+    assert problems == []
+
+
+def test_update_check_result_ignores_a_deleted_row(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    rid = _row("Lilia")["id"]
+    db.delete_restaurant(rid)
+
+    assert db.update_check_result(rid, "OPERATIONAL", False, "") is False
+    assert db.check_history(rid) == []
+
+
+def test_healthcheck_is_pinged_after_a_run(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    _patch_news(monkeypatch)
+    pings = _patch_healthcheck(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert pings == [True]
+
+
+def test_healthcheck_reports_failure_when_every_check_fails(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": RuntimeError("down")})
+    pings = _patch_healthcheck(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert pings == [False]
+
+
+def test_healthcheck_is_a_noop_without_a_url(monkeypatch):
+    import notifier
+    monkeypatch.delenv("HEALTHCHECK_URL", raising=False)
+    monkeypatch.setattr(notifier._session, "post", lambda *a, **k: 1 / 0)
+    notifier.ping_healthcheck()
+
+
+def test_healthcheck_posts_to_fail_endpoint(monkeypatch):
+    import notifier
+    urls = []
+    monkeypatch.setenv("HEALTHCHECK_URL", "https://hc.example/ping/abc/")
+    monkeypatch.setattr(notifier._session, "post", lambda url, **k: urls.append(url))
+    notifier.ping_healthcheck(ok=True)
+    notifier.ping_healthcheck(ok=False)
+    assert urls == ["https://hc.example/ping/abc", "https://hc.example/ping/abc/fail"]
+
+
+def test_scheduler_first_fires_now_when_there_has_been_no_run(tmp_path, monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    now = datetime.now()
+    assert main._next_run_time(now) == now
+
+
+def test_scheduler_waits_out_the_week_after_a_recent_run(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    main._write_run_count(1)
+    now = datetime.now()
+    nxt = main._next_run_time(now)
+    assert timedelta(days=6) < nxt - now <= timedelta(weeks=1)
+
+
+def test_scheduler_fires_now_when_the_last_run_is_over_a_week_old(tmp_path, monkeypatch):
+    import os
+    import time
+    from datetime import datetime
+    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    main._write_run_count(1)
+    old = time.time() - 8 * 86400
+    os.utime(main._run_count_file, (old, old))
+    now = datetime.now()
+    assert main._next_run_time(now) == now
+
+
+def test_restart_after_a_long_gap_notifies(tmp_path, monkeypatch):
+    import os
+    import time
+    from datetime import datetime
+    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    sent = []
+    monkeypatch.setattr(main, "notify_scheduler_gap", sent.append)
+
+    main._warn_if_scheduler_was_down(datetime.now())  # never ran: nothing to report
+    main._write_run_count(1)
+    main._warn_if_scheduler_was_down(datetime.now())  # just ran
+    assert sent == []
+
+    old = time.time() - 20 * 86400
+    os.utime(main._run_count_file, (old, old))
+    main._warn_if_scheduler_was_down(datetime.now())
+    assert sent == [20]

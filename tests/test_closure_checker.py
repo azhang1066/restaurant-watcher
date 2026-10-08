@@ -1,7 +1,8 @@
-"""Tests for closure_checker's JSON-extraction fallback -- the model is asked
-for strict JSON but sometimes wraps it in prose, so this defensively pulls
-out the {...} substring and must degrade to a safe default rather than
-raising when that still fails.
+"""Tests for closure_checker's JSON extraction -- the model is asked for
+strict JSON but sometimes wraps it in prose, so this pulls out the {...}
+substring. When that still fails (or the reply was cut off) it must *raise*:
+a default of "not closing" would be read by check_one as a real verdict and
+clear a live closing-soon flag.
 
 Also pins the client's retry/timeout configuration. That config used to be
 whatever the anthropic SDK defaulted to, which was quietly out of step with
@@ -17,27 +18,32 @@ import closure_checker
 
 
 class _FakeMessages:
-    def __init__(self, response_text, raises=None):
+    def __init__(self, response_text, raises=None, stop_reasons=None):
         self._response_text = response_text
         self._raises = raises
+        self._stop_reasons = list(stop_reasons or [])
+        self.calls = []
 
     def create(self, **kwargs):
+        self.calls.append(kwargs)
         if self._raises is not None:
             raise self._raises
+        stop = self._stop_reasons.pop(0) if self._stop_reasons else "end_turn"
         return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=self._response_text)]
+            stop_reason=stop,
+            content=[SimpleNamespace(type="text", text=self._response_text)],
         )
 
 
 class _FakeAnthropic:
-    def __init__(self, response_text, raises=None):
-        self.messages = _FakeMessages(response_text, raises)
+    def __init__(self, response_text, raises=None, stop_reasons=None):
+        self.messages = _FakeMessages(response_text, raises, stop_reasons)
 
 
-def _patch_client(monkeypatch, response_text, raises=None):
-    monkeypatch.setattr(
-        closure_checker, "_client", lambda: _FakeAnthropic(response_text, raises)
-    )
+def _patch_client(monkeypatch, response_text, raises=None, stop_reasons=None):
+    fake = _FakeAnthropic(response_text, raises, stop_reasons)
+    monkeypatch.setattr(closure_checker, "_client", lambda: fake)
+    return fake.messages
 
 
 def test_parses_clean_json(monkeypatch):
@@ -62,22 +68,56 @@ def test_extracts_json_wrapped_in_prose(monkeypatch):
     assert result == {"closing_soon": False, "confidence": "low", "summary": ""}
 
 
-def test_no_braces_falls_back_to_default(monkeypatch):
+def test_no_braces_raises(monkeypatch):
     _patch_client(monkeypatch, "I could not find any relevant news.")
-    result = closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
-    assert result == {"closing_soon": False, "confidence": "low", "summary": ""}
+    with pytest.raises(closure_checker.NewsCheckError):
+        closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
 
 
-def test_malformed_json_falls_back_to_default(monkeypatch):
+def test_malformed_json_raises(monkeypatch):
     _patch_client(monkeypatch, '{"closing_soon": true, "confidence": }')
+    with pytest.raises(closure_checker.NewsCheckError):
+        closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
+
+
+def test_truncated_reply_raises(monkeypatch):
+    """A reply cut off at max_tokens is not a verdict, even if what survived
+    happens to parse."""
+    _patch_client(monkeypatch,
+                  '{"closing_soon": false, "confidence": "low", "summary": ""}',
+                  stop_reasons=["max_tokens"])
+    with pytest.raises(closure_checker.NewsCheckError):
+        closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
+
+
+def test_pause_turn_is_continued(monkeypatch):
+    messages = _patch_client(
+        monkeypatch,
+        '{"closing_soon": true, "confidence": "high", "summary": "Closing."}',
+        stop_reasons=["pause_turn", "end_turn"])
     result = closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
-    assert result == {"closing_soon": False, "confidence": "low", "summary": ""}
+    assert result["closing_soon"] is True
+    assert len(messages.calls) == 2
+    assert messages.calls[1]["messages"][-1]["role"] == "assistant"
+
+
+def test_endless_pause_turn_raises(monkeypatch):
+    _patch_client(monkeypatch, "", stop_reasons=["pause_turn"] * 10)
+    with pytest.raises(closure_checker.NewsCheckError):
+        closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
 
 
 def test_missing_fields_default_within_parsed_json(monkeypatch):
     _patch_client(monkeypatch, '{"closing_soon": true}')
     result = closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
     assert result == {"closing_soon": True, "confidence": "low", "summary": ""}
+
+
+def test_invalid_field_values_are_sanitised(monkeypatch):
+    _patch_client(monkeypatch,
+                  '{"closing_soon": "yes", "confidence": "certain", "summary": 5}')
+    result = closure_checker.check_closing_soon("Lilia", "Brooklyn NY")
+    assert result == {"closing_soon": False, "confidence": "low", "summary": ""}
 
 
 # --- client configuration ----------------------------------------------

@@ -27,8 +27,9 @@ class _FakeSMTP:
     def __exit__(self, *exc):
         return False
 
-    def starttls(self):
+    def starttls(self, context=None):
         self.started_tls = True
+        self.tls_context = context
 
     def login(self, user, password):
         self.login_args = (user, password)
@@ -75,14 +76,76 @@ def test_ntfy_topic_read_at_call_time(monkeypatch):
     assert posts[0]["url"] == "https://ntfy.sh/set-after-import"
 
 
-def test_ntfy_falls_back_to_default_topic(monkeypatch):
+def test_ntfy_is_not_sent_without_a_private_topic(monkeypatch):
+    """The default topic is a public, guessable feed. Nothing may be posted to
+    it -- including the placeholder from .env.example."""
     _clear_email_env(monkeypatch)
     posts = _patch_ntfy(monkeypatch)
+
+    for topic in (None, notifier.DEFAULT_NTFY_TOPIC, "pick-a-unique-topic-name"):
+        if topic is None:
+            monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        else:
+            monkeypatch.setenv("NTFY_TOPIC", topic)
+        notifier.notify("Title", "Body")
+
+    assert posts == []
+
+
+def test_email_still_sent_when_ntfy_topic_is_unset(monkeypatch):
+    _clear_email_env(monkeypatch)
+    _patch_ntfy(monkeypatch)
+    fake = _patch_smtp(monkeypatch)
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("EMAIL_FROM", "a@example.com")
+    monkeypatch.setenv("EMAIL_TO", "b@example.com")
 
     notifier.notify("Title", "Body")
 
-    assert posts[0]["url"].endswith(notifier.DEFAULT_NTFY_TOPIC)
+    assert len(fake.instances[0].sent) == 1
+
+
+def test_starttls_verifies_the_server_certificate(monkeypatch):
+    import ssl
+    _clear_email_env(monkeypatch)
+    monkeypatch.setenv("NTFY_TOPIC", "private-topic")
+    _patch_ntfy(monkeypatch)
+    fake = _patch_smtp(monkeypatch)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("EMAIL_FROM", "a@example.com")
+    monkeypatch.setenv("EMAIL_TO", "b@example.com")
+
+    notifier.notify("Title", "Body")
+
+    context = fake.instances[0].tls_context
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+
+
+def test_port_465_uses_implicit_ssl(monkeypatch):
+    _clear_email_env(monkeypatch)
+    monkeypatch.setenv("NTFY_TOPIC", "private-topic")
+    _patch_ntfy(monkeypatch)
+    used = {}
+
+    class _FakeSMTPSSL(_FakeSMTP):
+        def __init__(self, host, port, timeout=None, context=None):
+            super().__init__(host, port, timeout)
+            used["context"] = context
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _FakeSMTPSSL)
+    monkeypatch.setattr(smtplib, "SMTP", lambda *a, **k: 1 / 0)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_PORT", "465")
+    monkeypatch.setenv("EMAIL_FROM", "a@example.com")
+    monkeypatch.setenv("EMAIL_TO", "b@example.com")
+
+    notifier.notify("Title", "Body")
+
+    assert used["context"] is not None
+    assert not _FakeSMTP.instances[-1].started_tls
+    assert len(_FakeSMTP.instances[-1].sent) == 1
 
 
 def test_email_skipped_when_unconfigured(monkeypatch):

@@ -15,21 +15,27 @@ until somebody looks. Unverified rows are skipped here (no Places call, no
 Claude call, no alerts) and a single push per run says how many are waiting.
 The dashboard is where they get confirmed or thrown out.
 
+Only one run happens at a time: `run_check` takes a lock file, so a manual
+`--once` beside a running scheduler (or two schedulers) skips rather than
+racing on the run counter and double-alerting.
+
 Run once manually:  python main.py --once
 Run on a schedule:   python main.py           (blocks, checks weekly)
 """
 import argparse
 import logging
 import os
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from checker import check_one, is_checkable
-from config import configure_logging, env_int
-from db import (DEFAULT_BACKUPS_KEPT, DEFAULT_RETAIN_DAYS, backup_db, init_db,
-                list_restaurants, prune_check_log)
-from notifier import notify_needs_verification, notify_run_problems
+from config import STALE_AFTER_DAYS, configure_logging, env_int
+from db import (DEFAULT_BACKUPS_KEPT, DEFAULT_RETAIN_DAYS, backup_db,
+                get_restaurant, init_db, list_restaurants, prune_check_log)
+from notifier import (notify_needs_verification, notify_run_problems,
+                      notify_scheduler_gap, ping_healthcheck)
 from places_client import PlaceNotFound
 
 logger = logging.getLogger(__name__)
@@ -76,7 +82,55 @@ def _write_run_count(count):
     os.replace(tmp, _run_count_file)
 
 
+class RunInProgress(Exception):
+    """Another process holds the run lock."""
+
+
+@contextmanager
+def _run_lock():
+    """Exclusive, non-blocking OS lock on a file beside the run counter.
+
+    An OS lock rather than a marker file, so a crashed run can't leave a stale
+    lock behind: the lock dies with its process.
+    """
+    path = _run_count_file + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, "a+b")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise RunInProgress(path) from e
+        yield
+    finally:
+        f.close()  # closing releases the lock
+
+
+def _last_run_at():
+    """When the last run finished, or None if none has. The run counter is
+    only rewritten at the end of a completed run, so its mtime is that."""
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(_run_count_file))
+    except OSError:
+        return None
+
+
 def run_check(include_news_check=None):
+    """One full pass, unless another is already running -- see `_run_lock`."""
+    try:
+        with _run_lock():
+            _run_check(include_news_check)
+    except RunInProgress:
+        logger.warning("Another check run is already in progress -- skipping this one.")
+
+
+def _run_check(include_news_check):
     init_db()
     # Only recorded once the run has finished (see the end of this function),
     # so a run that dies partway doesn't advance the news-check cadence.
@@ -96,7 +150,16 @@ def run_check(include_news_check=None):
 
     failures = news_failures = 0
     gone = []
-    for r in restaurants:
+    for listed in restaurants:
+        # The list was read before the loop started and a run can take a
+        # while: re-read the row, so one deleted, archived or un-verified from
+        # the dashboard meanwhile isn't checked (or alerted on) from a stale
+        # copy, and the flags carried forward are current.
+        r = get_restaurant(listed["id"])
+        if r is None or not is_checkable(r):
+            logger.info("Skipping %s (id=%s): changed during the run",
+                        listed["name"], listed["id"])
+            continue
         try:
             news_failures += check_one(r, include_news_check=include_news_check)["news_failed"]
         except PlaceNotFound:
@@ -147,6 +210,10 @@ def run_check(include_news_check=None):
         logger.exception("Couldn't record the run count -- the news-check "
                          "cadence won't advance this run")
 
+    # Tell the external monitor this run finished. Every check failing points
+    # at the key or the network, so that run reports as a failure.
+    ping_healthcheck(ok=not (failures and failures == len(restaurants)))
+
     logger.info("Done. %d/%d restaurants failed.", failures, len(restaurants))
     if unverified:
         logger.warning("%d restaurant(s) skipped pending verification: %s. Confirm them "
@@ -155,6 +222,43 @@ def run_check(include_news_check=None):
     if news_failures:
         logger.warning("%d news check(s) failed; those restaurants kept their stored "
                        "closing-soon flag.", news_failures)
+
+
+def _next_run_time(now):
+    """When the scheduler should first fire: now if a week has passed since the
+    last completed run (or there never was one), otherwise when that week is
+    up. Firing on every start would run a check -- and advance the news-check
+    cadence -- each time the process is restarted."""
+    last = _last_run_at()
+    if last is None or last + timedelta(weeks=1) <= now:
+        return now
+    return last + timedelta(weeks=1)
+
+
+def _warn_if_scheduler_was_down(now):
+    last = _last_run_at()
+    if last is None or (now - last).days < STALE_AFTER_DAYS:
+        return
+    days = (now - last).days
+    logger.warning("No check completed for %d days before this start.", days)
+    try:
+        notify_scheduler_gap(days)
+    except Exception:
+        logger.exception("Couldn't send the scheduler-gap notification -- continuing")
+
+
+def start_scheduler():
+    now = datetime.now()
+    _warn_if_scheduler_was_down(now)
+    scheduler = BlockingScheduler()
+    # max_instances/coalesce: never overlap runs, and collapse missed ones into
+    # one. misfire_grace_time=None: a laptop asleep at the due time still runs
+    # the check on waking, instead of APScheduler's default of skipping it
+    # after one second.
+    scheduler.add_job(run_check, "interval", weeks=1, next_run_time=_next_run_time(now),
+                      max_instances=1, coalesce=True, misfire_grace_time=None)
+    logger.info("Scheduler started -- checking weekly. Ctrl+C to stop.")
+    scheduler.start()
 
 
 if __name__ == "__main__":
@@ -166,7 +270,4 @@ if __name__ == "__main__":
     if args.once:
         run_check()
     else:
-        scheduler = BlockingScheduler()
-        scheduler.add_job(run_check, "interval", weeks=1, next_run_time=datetime.now())
-        logger.info("Scheduler started -- checking weekly. Ctrl+C to stop.")
-        scheduler.start()
+        start_scheduler()
