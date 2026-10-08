@@ -24,15 +24,14 @@ import os
 from datetime import datetime
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from dotenv import load_dotenv
 
 from checker import check_one, is_checkable
-from db import DEFAULT_RETAIN_DAYS, init_db, list_restaurants, prune_check_log
-from notifier import notify_needs_verification
+from config import configure_logging, env_int
+from db import (DEFAULT_BACKUPS_KEPT, DEFAULT_RETAIN_DAYS, backup_db, init_db,
+                list_restaurants, prune_check_log)
+from notifier import notify_needs_verification, notify_run_problems
+from places_client import PlaceNotFound
 
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLOSING_SOON_CHECK_EVERY = 4
@@ -43,13 +42,18 @@ _run_count_file = os.path.join(os.path.dirname(__file__), "data", ".run_count")
 def _closing_soon_check_every():
     """Read at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern."""
-    return int(os.environ.get("CLOSING_SOON_CHECK_EVERY") or DEFAULT_CLOSING_SOON_CHECK_EVERY)
+    return env_int("CLOSING_SOON_CHECK_EVERY", DEFAULT_CLOSING_SOON_CHECK_EVERY)
 
 
 def _check_log_retain_days():
     """Days of per-check detail to keep before folding into monthly rollups;
     0 disables pruning. Read at call time for the same reason as above."""
-    return int(os.environ.get("CHECK_LOG_RETAIN_DAYS") or DEFAULT_RETAIN_DAYS)
+    return env_int("CHECK_LOG_RETAIN_DAYS", DEFAULT_RETAIN_DAYS)
+
+
+def _backups_kept():
+    """How many database backups to keep; 0 disables them."""
+    return env_int("BACKUPS_KEPT", DEFAULT_BACKUPS_KEPT)
 
 
 def _read_run_count():
@@ -91,9 +95,15 @@ def run_check(include_news_check=None):
                 f", {len(unverified)} unverified and skipped" if unverified else "")
 
     failures = news_failures = 0
+    gone = []
     for r in restaurants:
         try:
             news_failures += check_one(r, include_news_check=include_news_check)["news_failed"]
+        except PlaceNotFound:
+            failures += 1
+            gone.append(r)
+            logger.error("Google no longer recognises %s (id=%s, place_id=%s) -- "
+                         "skipping", r["name"], r["id"], r["place_id"])
         except Exception:
             failures += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
@@ -107,6 +117,12 @@ def run_check(include_news_check=None):
         except Exception:
             logger.exception("Couldn't send the needs-verifying notification -- continuing")
 
+    if failures:
+        try:
+            notify_run_problems(failures, len(restaurants), gone)
+        except Exception:
+            logger.exception("Couldn't send the check-failures notification -- continuing")
+
     retain_days = _check_log_retain_days()
     if retain_days > 0:
         try:
@@ -117,6 +133,13 @@ def run_check(include_news_check=None):
         except Exception:
             # Housekeeping only -- never fail a run whose checks already landed.
             logger.exception("check_log pruning failed -- continuing")
+
+    keep = _backups_kept()
+    if keep > 0:
+        try:
+            backup_db(keep)
+        except Exception:
+            logger.exception("Database backup failed -- continuing")
 
     try:
         _write_run_count(run_count)
@@ -135,6 +158,7 @@ def run_check(include_news_check=None):
 
 
 if __name__ == "__main__":
+    configure_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Run a single check and exit")
     args = parser.parse_args()

@@ -227,3 +227,36 @@ def test_needs_verification_push_links_to_the_dashboard(monkeypatch):
 
     assert posts[0]["headers"]["Click"] == "http://pi.local:5000"
     assert "1 restaurant to verify" in _title(posts[0])  # singular
+
+
+def test_closed_alert_with_a_null_address_says_no_address(monkeypatch):
+    """The column is NULL for a place without an address; the old
+    .get('address', '') let None through and the push body read "None"."""
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify_closed({"name": "Lilia", "address": None, "maps_url": None},
+                           "CLOSED_PERMANENTLY")
+
+    assert posts[0]["data"].decode("utf-8") == "No address on file."
+
+
+def test_run_problems_push_names_the_places_google_dropped(monkeypatch):
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify_run_problems(2, 10, [{"name": "Lilia"}])
+
+    assert "2 checks failed" in _title(posts[0])
+    body = posts[0]["data"].decode("utf-8")
+    assert "2 of 10" in body and "Lilia" in body
+    assert posts[0]["headers"]["Priority"] == "default"
+
+
+def test_run_problems_push_is_high_priority_when_everything_failed(monkeypatch):
+    _clear_email_env(monkeypatch)
+    posts = _patch_ntfy(monkeypatch)
+
+    notifier.notify_run_problems(3, 3, [])
+
+    assert posts[0]["headers"]["Priority"] == "high"

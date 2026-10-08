@@ -4,8 +4,9 @@ Essentials/Pro tier, so a weekly check of a few hundred places costs cents.
 Avoid adding rating/hours/photos/phone fields here; those bump every call
 to the Enterprise SKU.
 """
-import os
+import requests
 
+from config import env_str
 from http_session import retrying_session
 from statuses import OPERATIONAL
 
@@ -14,8 +15,16 @@ PLACES_BASE = "https://places.googleapis.com/v1"
 _session = retrying_session(("GET", "POST"))
 
 
+class PlaceNotFound(Exception):
+    """Places answered 404 for a place_id: Google no longer recognises it.
+
+    Distinct from a transient failure because retrying never helps -- place
+    ids can be retired or merged, and the row has to be found again by hand.
+    """
+
+
 def _api_key():
-    key = os.environ.get("GOOGLE_PLACES_API_KEY")
+    key = env_str("GOOGLE_PLACES_API_KEY")
     if not key:
         raise RuntimeError("Set GOOGLE_PLACES_API_KEY in your environment / .env")
     return key
@@ -61,6 +70,8 @@ def get_business_status(place_id):
         "X-Goog-FieldMask": "id,businessStatus,displayName",
     }
     resp = _session.get(url, headers=headers, timeout=15)
+    if resp.status_code == 404:
+        raise PlaceNotFound(place_id)
     resp.raise_for_status()
     data = resp.json()
     return data.get("businessStatus", OPERATIONAL)

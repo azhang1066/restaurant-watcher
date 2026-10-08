@@ -226,6 +226,21 @@ detail rows regardless of age, so the interesting history never gets summarized
 away. `db.check_history(restaurant_id)` reads the two tables back as one
 per-month view. Set `CHECK_LOG_RETAIN_DAYS=0` to keep everything.
 
+## Backups
+
+The database holds your hand-verified list and `data/` is gitignored, so each
+run ends by copying it to `data/backups/restaurants-<timestamp>.db` and keeping
+the newest `BACKUPS_KEPT` (default 8). Set `BACKUPS_KEPT=0` to turn that off.
+To restore, stop the scheduler and dashboard and copy a backup over
+`data/restaurants.db`.
+
+## When checks fail
+
+A run that couldn't check some restaurants sends one push saying how many,
+and names any that Google answers 404 for (a retired place id). Those keep
+failing every run until you delete the row and add the place again from the
+dashboard.
+
 ## Cost notes
 
 - Places `businessStatus` stays in the cheap Essentials/Pro tier (~$5/1K

@@ -2,15 +2,18 @@
 import logging
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
-from statuses import ALL_STATUSES, CLOSED_PERMANENTLY, OPERATIONAL
+from statuses import (ALL_STATUSES, CLOSED_PERMANENTLY, CLOSED_STATUSES,
+                      OPERATIONAL)
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "data" / "restaurants.db"
 
 _STATUS_LIST = ", ".join(f"'{s}'" for s in ALL_STATUSES)
+_CLOSED_LIST = ", ".join(f"'{s}'" for s in CLOSED_STATUSES)
 
 # The restaurants table as of the latest schema version. Also what migration 2
 # rebuilds an older table into, so there is one definition of it, not two.
@@ -71,6 +74,7 @@ CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
 """
 
 DEFAULT_RETAIN_DAYS = 90
+DEFAULT_BACKUPS_KEPT = 8
 
 # The dashboard and the scheduler are separate processes sharing one file.
 # Wait this long for the other's write lock instead of failing at once with
@@ -244,7 +248,13 @@ def get_restaurant_by_place_id(place_id):
     return dict(row) if row else None
 
 
-def update_check_result(restaurant_id, business_status, closing_soon_flag, closing_soon_summary):
+def update_check_result(restaurant_id, business_status, closing_soon_flag,
+                        closing_soon_summary, archive=False):
+    """Record one check: the row's new state plus its check_log entry.
+
+    `archive` flips the archived flag in the same transaction, so a crash
+    can't leave a permanently closed row recorded but still on the active list.
+    """
     with get_conn() as conn:
         conn.execute(
             """UPDATE restaurants
@@ -258,6 +268,8 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag, closi
                VALUES (?, ?, ?)""",
             (restaurant_id, business_status, int(closing_soon_flag)),
         )
+        if archive:
+            conn.execute("UPDATE restaurants SET archived = 1 WHERE id = ?", (restaurant_id,))
 
 
 def archive_restaurant(restaurant_id):
@@ -338,7 +350,7 @@ def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
     without bound. Rows older than `retain_days` are dropped -- except the
     ones that carry signal: each restaurant's first logged check, and every
     check where business_status or closing_soon_flag differed from the check
-    before it. Those are the transitions main.py notifies on, so they stay
+    before it. Those are the transitions checker.check_one notifies on, so they stay
     queryable at any age while the long runs of "same as last week" rows
     collapse into per-month counts.
 
@@ -370,7 +382,7 @@ def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
             (f"-{int(retain_days)} days",),
         )
         conn.execute(
-            """
+            f"""
             INSERT INTO check_log_monthly (
                 restaurant_id, month, checks, operational_checks, closed_checks,
                 closing_soon_checks, first_checked_at, last_checked_at
@@ -378,8 +390,8 @@ def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
             SELECT c.restaurant_id,
                    strftime('%Y-%m', c.checked_at),
                    COUNT(*),
-                   SUM(CASE WHEN c.business_status = 'OPERATIONAL' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN c.business_status LIKE 'CLOSED%' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN c.business_status = '{OPERATIONAL}' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN c.business_status IN ({_CLOSED_LIST}) THEN 1 ELSE 0 END),
                    SUM(CASE WHEN c.closing_soon_flag = 1 THEN 1 ELSE 0 END),
                    MIN(c.checked_at),
                    MAX(c.checked_at)
@@ -411,7 +423,7 @@ def check_history(restaurant_id):
     detail rows still in check_log, merged into one row per month."""
     with get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT month,
                    SUM(checks) AS checks,
                    SUM(operational_checks) AS operational_checks,
@@ -427,8 +439,8 @@ def check_history(restaurant_id):
                 UNION ALL
                 SELECT strftime('%Y-%m', checked_at),
                        COUNT(*),
-                       SUM(CASE WHEN business_status = 'OPERATIONAL' THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN business_status LIKE 'CLOSED%' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN business_status = '{OPERATIONAL}' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN business_status IN ({_CLOSED_LIST}) THEN 1 ELSE 0 END),
                        SUM(CASE WHEN closing_soon_flag = 1 THEN 1 ELSE 0 END),
                        MIN(checked_at),
                        MAX(checked_at)
@@ -442,3 +454,30 @@ def check_history(restaurant_id):
             (restaurant_id, restaurant_id),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def backup_db(keep=DEFAULT_BACKUPS_KEPT):
+    """Copy the database to a timestamped file in `backups/` beside it, then
+    delete all but the newest `keep`. Returns the new file's path.
+
+    The dashboard's verify queue is hand-done work with no other copy, and
+    `data/` is gitignored. Uses SQLite's online backup API, which is safe
+    while the dashboard has the file open (a plain file copy isn't in WAL
+    mode).
+    """
+    init_db()
+    folder = DB_PATH.parent / "backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = folder / f"{DB_PATH.stem}-{stamp}.db"
+    with get_conn() as source:
+        dest = sqlite3.connect(target)
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    # Names sort chronologically, so the oldest are the head of the list.
+    old = sorted(folder.glob(f"{DB_PATH.stem}-*.db"))[:-keep] if keep > 0 else []
+    for path in old:
+        path.unlink()
+    return target

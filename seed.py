@@ -20,18 +20,12 @@ Where restaurants.txt has one restaurant per line, e.g.:
 import logging
 import sys
 
-from dotenv import load_dotenv
-
+import config
 from db import (add_restaurant, get_restaurant_by_place_id, init_db,
                 list_restaurants)
 from places_client import find_place_id, place_summary
 
 logger = logging.getLogger(__name__)
-
-# Same as main.py and app.py do at import. Nothing further down the import
-# chain loads it -- places_client reads GOOGLE_PLACES_API_KEY out of the
-# environment at call time.
-load_dotenv()
 
 
 def _parse_line(line):

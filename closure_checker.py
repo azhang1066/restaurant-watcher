@@ -5,9 +5,10 @@ hard API field, so it's run less often than the Places status check
 (every CLOSING_SOON_CHECK_EVERY runs) to keep cost and noise down.
 """
 import json
-import os
 
 import anthropic
+
+from config import env_str
 
 # Default model and server-side tool version. Both are API identifiers that
 # get retired, so the model can be overridden from `.env` (CLOSURE_CHECK_MODEL)
@@ -38,7 +39,7 @@ Respond with ONLY a JSON object, no other text, in this exact shape:
 
 def _model():
     """Read at call time for the same reason as `_client()`."""
-    return os.environ.get("CLOSURE_CHECK_MODEL") or MODEL
+    return env_str("CLOSURE_CHECK_MODEL", MODEL)
 
 
 def _client():

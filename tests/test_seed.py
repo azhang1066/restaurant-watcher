@@ -27,9 +27,11 @@ def test_seed_loads_the_env_file_at_import(monkeypatch):
     calls = []
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **kw: calls.append(True))
 
-    importlib.reload(seed)
+    import config
+    importlib.reload(config)
 
-    assert calls, "seed.py must load .env -- it's the only entry point that reads a key"
+    assert calls, "config must load .env -- every entry point imports it"
+    assert seed.config is config, "seed.py must import config to get .env loaded"
 
 
 def test_seeded_restaurants_are_not_verified(tmp_path, monkeypatch):

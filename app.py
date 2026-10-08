@@ -53,11 +53,9 @@ Run it:
 """
 import hmac
 import logging
-import os
 import secrets
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
 from flask import (Flask, abort, flash, redirect, render_template, request,
                    session, url_for)
 
@@ -65,14 +63,13 @@ from db import (add_restaurant, check_history, delete_restaurant,
                 get_restaurant, get_restaurant_by_place_id, init_db,
                 list_restaurants, unarchive_restaurant, verify_restaurant,
                 verify_restaurants)
-from places_client import find_place_id, place_summary
+from config import configure_logging, env_str
+from places_client import PlaceNotFound, find_place_id, place_summary
 # The dashboard runs the same check the scheduler does rather than a second
 # implementation of it -- see checker.check_one.
 from checker import check_one, is_checkable
 from statuses import (CLOSED_PERMANENTLY, CLOSED_STATUSES, CLOSED_TEMPORARILY,
                       OPERATIONAL)
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +91,9 @@ _STATUS_LABELS = {
     CLOSED_PERMANENTLY: "Closed permanently",
 }
 
+# Badge colour per status; anything else (e.g. an unspecified status) is "bad".
+_STATUS_BADGES = {OPERATIONAL: "ok", CLOSED_TEMPORARILY: "warn"}
+
 # Sort the worst news to the top of the list.
 _STATUS_RANK = {CLOSED_PERMANENTLY: 0, CLOSED_TEMPORARILY: 1, OPERATIONAL: 2}
 
@@ -105,7 +105,7 @@ def _secret_key():
     tokens don't outlive a restart -- but it's logged, because silently
     invalidating sessions on every reload is confusing if you didn't expect it.
     """
-    key = os.environ.get("DASHBOARD_SECRET_KEY")
+    key = env_str("DASHBOARD_SECRET_KEY")
     if key:
         return key
     logger.info("No DASHBOARD_SECRET_KEY set -- generating a per-process key. "
@@ -191,6 +191,7 @@ def _view(restaurant, now):
         "maps_url": restaurant.get("maps_url") or "",
         "status": status,
         "status_label": _STATUS_LABELS.get(status, status),
+        "status_badge": _STATUS_BADGES.get(status, "bad"),
         "closing_soon": closing_soon,
         # A closing-soon flag is news about a *future* closure, so it stops
         # being news once the place is shut for good. Decided here rather than
@@ -230,23 +231,9 @@ def _sort_key(view):
 
 # --- routes ---------------------------------------------------------------
 #
-# Plain module-level functions, registered onto the app by create_app(). Not
-# a Blueprint: that would prefix every endpoint name and break the
-# url_for("index") calls in the templates.
-
-_ROUTES = []
+# Registered by create_app() from _URLS at the bottom of this module.
 
 
-def _route(rule, methods=("GET",)):
-    """Record a view for create_app() to register. The function's own name is
-    its endpoint, exactly as `@app.route` would have made it."""
-    def decorator(view):
-        _ROUTES.append((rule, view.__name__, view, list(methods)))
-        return view
-    return decorator
-
-
-@_route("/")
 def index():
     now = datetime.now(timezone.utc)
     views = sorted((_view(r, now) for r in list_restaurants(active_only=False)),
@@ -269,6 +256,7 @@ def index():
                            # so the box is ready for a narrower query.
                            prefill=(request.args.get("q") or "")[:MAX_QUERY_CHARS])
 
+
 def _back_to(restaurant_id):
     """Send a POST back to the page it came from.
 
@@ -281,7 +269,7 @@ def _back_to(restaurant_id):
         return redirect(url_for("index"))
     return redirect(url_for("detail", restaurant_id=restaurant_id))
 
-@_route("/restaurant/<int:restaurant_id>")
+
 def detail(restaurant_id):
     restaurant = get_restaurant(restaurant_id)
     if restaurant is None:
@@ -292,7 +280,7 @@ def detail(restaurant_id):
         history=list(reversed(check_history(restaurant_id))),
     )
 
-@_route("/restaurant/<int:restaurant_id>/unarchive", methods=("POST",))
+
 def unarchive(restaurant_id):
     _require_csrf()
     restaurant = get_restaurant(restaurant_id)
@@ -324,7 +312,7 @@ def unarchive(restaurant_id):
 
 # --- checking a restaurant now ---------------------------------------
 
-@_route("/restaurant/<int:restaurant_id>/check", methods=("POST",))
+
 def check_now(restaurant_id):
     """Re-poll Google Places for this one restaurant, right now.
 
@@ -353,6 +341,13 @@ def check_now(restaurant_id):
     previous = restaurant["business_status"]
     try:
         result = check_one(restaurant)
+    except PlaceNotFound:
+        logger.error("Manual check: Google no longer recognises %s (id=%s, "
+                     "place_id=%s)", restaurant["name"], restaurant_id,
+                     restaurant["place_id"])
+        flash(f"Google no longer recognises {restaurant['name']}'s place id. "
+              "Delete it and add it again with the search box.", "warn")
+        return _back_to(restaurant_id)
     except Exception:
         # Places was unreachable (or the key is wrong), or the alert
         # couldn't be sent. check_one writes nothing until both have
@@ -384,7 +379,7 @@ def check_now(restaurant_id):
 
 # --- removing a restaurant -------------------------------------------
 
-@_route("/restaurant/<int:restaurant_id>/delete", methods=("POST",))
+
 def delete(restaurant_id):
     """Stop watching a restaurant: drop the row and everything logged
     about it.
@@ -423,7 +418,7 @@ def delete(restaurant_id):
 
 # --- verifying a restaurant ------------------------------------------
 
-@_route("/restaurant/<int:restaurant_id>/verify", methods=("POST",))
+
 def verify(restaurant_id):
     """Yes, that's the place. From here on the scheduled run will check it."""
     _require_csrf()
@@ -443,7 +438,7 @@ def verify(restaurant_id):
           "include it.", "info")
     return _back_to(restaurant_id)
 
-@_route("/verify-selected", methods=("POST",))
+
 def verify_selected():
     """Yes, those are all the right places -- for every ticked row at once.
 
@@ -474,7 +469,7 @@ def verify_selected():
         flash("Those were already verified.", "info")
     return redirect(url_for("index"))
 
-@_route("/restaurant/<int:restaurant_id>/reject", methods=("POST",))
+
 def reject(restaurant_id):
     """No, wrong place. Delete the row and re-open the search.
 
@@ -501,7 +496,7 @@ def reject(restaurant_id):
 
 # --- adding a restaurant ---------------------------------------------
 
-@_route("/add", methods=("POST",))
+
 def add_search():
     """Step 1: ask Places what this name resolves to.
 
@@ -552,7 +547,7 @@ def add_search():
     session["pending_add"] = dict(candidate, query=query)
     return redirect(url_for("add_confirm"))
 
-@_route("/add/confirm")
+
 def add_confirm():
     """Step 2: show the single best guess and make the user agree to it."""
     candidate = session.get("pending_add")
@@ -563,7 +558,7 @@ def add_confirm():
         return redirect(url_for("index"))
     return render_template("confirm_add.html", candidate=candidate)
 
-@_route("/add/confirm", methods=("POST",))
+
 def add_commit():
     """Step 3: write the row. No API call here -- this only ever stores
     the candidate the search already paid for."""
@@ -614,18 +609,23 @@ def add_commit():
     return redirect(url_for("detail", restaurant_id=added["id"]))
 
 
-def _configure_logging():
-    """Give this module's loggers somewhere to go. `flask run` only wires up
-    Flask's own logger, so without a root handler every logger.info() here --
-    the CSRF key warning, "Added ...", "Deleted ..." -- is silently dropped.
-    Left alone when a handler already exists (tests, an embedding server)."""
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO,
-                            format="%(asctime)s %(levelname)s %(message)s")
+_URLS = [
+    ("/", index, ("GET",)),
+    ("/restaurant/<int:restaurant_id>", detail, ("GET",)),
+    ("/restaurant/<int:restaurant_id>/unarchive", unarchive, ("POST",)),
+    ("/restaurant/<int:restaurant_id>/check", check_now, ("POST",)),
+    ("/restaurant/<int:restaurant_id>/delete", delete, ("POST",)),
+    ("/restaurant/<int:restaurant_id>/verify", verify, ("POST",)),
+    ("/verify-selected", verify_selected, ("POST",)),
+    ("/restaurant/<int:restaurant_id>/reject", reject, ("POST",)),
+    ("/add", add_search, ("POST",)),
+    ("/add/confirm", add_confirm, ("GET",)),
+    ("/add/confirm", add_commit, ("POST",)),
+]
 
 
 def create_app():
-    _configure_logging()
+    configure_logging()
     app = Flask(__name__)
     app.secret_key = _secret_key()
     app.jinja_env.globals["csrf_token"] = _csrf_token
@@ -635,8 +635,10 @@ def create_app():
     # table" instead of showing an honest empty list.
     init_db()
 
-    for rule, endpoint, view, methods in _ROUTES:
-        app.add_url_rule(rule, endpoint, view, methods=methods)
+    # The endpoint name is the function's name, which is what the templates'
+    # url_for() calls use.
+    for rule, view, methods in _URLS:
+        app.add_url_rule(rule, view_func=view, methods=methods)
     return app
 
 

@@ -5,7 +5,10 @@ decides what actually lands in the `restaurants` row in both. The HTTP
 functions around it stay untested on purpose -- they're a request and a
 field mask, and faking `requests` would only assert the mock.
 """
-from places_client import place_summary
+import pytest
+
+import places_client
+from places_client import PlaceNotFound, place_summary
 
 
 def test_place_summary_maps_a_search_hit_to_row_fields():
@@ -52,3 +55,32 @@ def test_place_summary_falls_back_on_an_empty_display_name():
                            fallback_name="Don Angie")
 
     assert fields["name"] == "Don Angie"
+
+
+class _Resp:
+    def __init__(self, status_code, body=None):
+        self.status_code = status_code
+        self._body = body or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._body
+
+
+def test_a_404_for_a_place_id_is_place_not_found(monkeypatch):
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(places_client._session, "get", lambda *a, **kw: _Resp(404))
+
+    with pytest.raises(PlaceNotFound):
+        places_client.get_business_status("gone")
+
+
+def test_other_http_errors_are_not_place_not_found(monkeypatch):
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(places_client._session, "get", lambda *a, **kw: _Resp(403))
+
+    with pytest.raises(RuntimeError):
+        places_client.get_business_status("p1")

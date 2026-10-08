@@ -3,11 +3,11 @@ uses, so this can share a topic/setup if you want one phone feed for both)
 and, optionally, email via SMTP.
 """
 import logging
-import os
 import smtplib
 from email.header import Header
 from email.message import EmailMessage
 
+from config import env_int, env_str
 from http_session import retrying_session
 from statuses import CLOSED_PERMANENTLY
 
@@ -27,29 +27,29 @@ _session = retrying_session(("POST",))
 def _ntfy_url():
     """Read at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern."""
-    return f"https://ntfy.sh/{os.environ.get('NTFY_TOPIC', DEFAULT_NTFY_TOPIC)}"
+    return f"https://ntfy.sh/{env_str('NTFY_TOPIC', DEFAULT_NTFY_TOPIC)}"
 
 
 def _dashboard_url():
     """Where to send someone who taps the verify notification. Read at call
     time for the same reason as `_ntfy_url()`."""
-    return os.environ.get("DASHBOARD_URL") or DEFAULT_DASHBOARD_URL
+    return env_str("DASHBOARD_URL", DEFAULT_DASHBOARD_URL)
 
 
 def _email_settings():
     """SMTP config, or None when email isn't configured (host/from/to are the
     required trio). Read at call time for the same reason as `_ntfy_url()`."""
-    user = os.environ.get("SMTP_USER")
-    host = os.environ.get("SMTP_HOST")
-    sender = os.environ.get("EMAIL_FROM") or user
-    to = os.environ.get("EMAIL_TO")
+    user = env_str("SMTP_USER")
+    host = env_str("SMTP_HOST")
+    sender = env_str("EMAIL_FROM") or user
+    to = env_str("EMAIL_TO")
     if not (host and sender and to):
         return None
     return {
         "host": host,
-        "port": int(os.environ.get("SMTP_PORT") or 587),
+        "port": env_int("SMTP_PORT", 587),
         "user": user,
-        "password": os.environ.get("SMTP_PASSWORD"),
+        "password": env_str("SMTP_PASSWORD"),
         "sender": sender,
         "to": to,
     }
@@ -108,7 +108,9 @@ def notify_closed(restaurant, status):
     label = "permanently closed" if status == CLOSED_PERMANENTLY else "temporarily closed"
     notify(
         title=f"🚫 {restaurant['name']} is {label}",
-        message=f"{restaurant.get('address', '')}".strip() or "No address on file.",
+        # `or ""`: the column is NULL for a place with no address, and .get()'s
+        # default only covers a missing key, so None would print as "None".
+        message=(restaurant.get("address") or "").strip() or "No address on file.",
         priority="high",
         url=restaurant.get("maps_url"),
     )
@@ -142,5 +144,30 @@ def notify_needs_verification(restaurants):
         message=f"{shown}\n\nNot being checked until you confirm each one is the "
                 f"right place on the dashboard.",
         priority="default",
+        url=_dashboard_url(),
+    )
+
+
+def notify_run_problems(failed, total, gone):
+    """One push when a run couldn't check some restaurants.
+
+    A failure that is only logged looks, from the phone, exactly like a quiet
+    week -- and a watcher that has stopped watching is the one thing this
+    tool can't afford. `gone` is the subset Google answered 404 for: those
+    will fail again every run until they're found again by hand.
+    """
+    parts = [f"{failed} of {total} restaurant checks failed -- see the log."]
+    if gone:
+        names = [r["name"] for r in gone]
+        shown = ", ".join(names[:NAMES_IN_VERIFY_PUSH])
+        if len(names) > NAMES_IN_VERIFY_PUSH:
+            shown += f", and {len(names) - NAMES_IN_VERIFY_PUSH} more"
+        parts.append(f"Google no longer recognises: {shown}. Delete and re-add "
+                     "them on the dashboard.")
+    notify(
+        title=f"⚠️ {failed} check{'s' if failed != 1 else ''} failed",
+        message="\n\n".join(parts),
+        # Every check failing points at the key or the network, not a place.
+        priority="high" if failed == total else "default",
         url=_dashboard_url(),
     )

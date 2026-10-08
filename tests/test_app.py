@@ -1364,22 +1364,24 @@ def test_logging_is_configured_when_nothing_has(monkeypatch):
     """`flask run` leaves the root logger without a handler, which drops
     every logger.info() in this module -- including the secret-key warning."""
     import logging
+    import config
     root = logging.getLogger()
     monkeypatch.setattr(root, "handlers", [])
     calls = []
     monkeypatch.setattr(logging, "basicConfig", lambda **kw: calls.append(kw))
 
-    dashboard._configure_logging()
+    config.configure_logging()
 
     assert calls and calls[0]["level"] == logging.INFO
 
 
 def test_existing_logging_is_left_alone(monkeypatch):
     import logging
+    import config
     monkeypatch.setattr(logging.getLogger(), "handlers", [logging.NullHandler()])
     calls = []
     monkeypatch.setattr(logging, "basicConfig", lambda **kw: calls.append(kw))
 
-    dashboard._configure_logging()
+    config.configure_logging()
 
     assert calls == []

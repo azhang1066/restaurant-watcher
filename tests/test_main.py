@@ -23,6 +23,7 @@ import logging
 import checker
 import db
 import main
+from places_client import PlaceNotFound
 
 
 def _news(closing_soon, confidence="high", summary=""):
@@ -49,6 +50,9 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),),
     monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
     for var in ("CLOSING_SOON_CHECK_EVERY", "CHECK_LOG_RETAIN_DAYS"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("BACKUPS_KEPT", raising=False)
+    # Never let a failing check in these tests push to the real ntfy topic.
+    _patch_problem_notifier(monkeypatch)
     db.init_db()
     for name, place_id in restaurants:
         db.add_restaurant(name, place_id, address=f"{name} address",
@@ -114,6 +118,20 @@ def _patch_verify_notifier(monkeypatch, raises=None):
         sent.append([r["name"] for r in restaurants])
 
     monkeypatch.setattr(main, "notify_needs_verification", _fake)
+    return sent
+
+
+def _patch_problem_notifier(monkeypatch, raises=None):
+    """Fake the check-failures push. Records (failed, total, names of the
+    404s) per call."""
+    sent = []
+
+    def _fake(failed, total, gone):
+        if raises is not None:
+            raise raises
+        sent.append((failed, total, [r["name"] for r in gone]))
+
+    monkeypatch.setattr(main, "notify_run_problems", _fake)
     return sent
 
 
@@ -745,3 +763,71 @@ def test_archived_unverified_restaurant_is_not_nagged_about(tmp_path, monkeypatc
     main.run_check()
 
     assert sent == []
+
+
+# --- failures are pushed, not just logged --------------------------------
+
+def test_failed_checks_send_one_push(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "p1"), ("Don Angie", "p2")))
+    _patch_places(monkeypatch, {"p1": RuntimeError("boom"), "p2": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    sent = _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert sent == [(1, 2, [])]
+
+
+def test_a_clean_run_sends_no_failure_push(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    sent = _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert sent == []
+
+
+def test_a_place_google_no_longer_knows_is_named_in_the_push(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "p1"), ("Don Angie", "p2")))
+    _patch_places(monkeypatch, {"p1": PlaceNotFound("p1"), "p2": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+    sent = _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert sent == [(1, 2, ["Lilia"])]
+    assert _row("Don Angie")["last_checked_at"] is not None
+
+
+def test_a_dead_failure_push_does_not_fail_the_run(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": RuntimeError("boom")})
+    _patch_notifiers(monkeypatch)
+    _patch_problem_notifier(monkeypatch, raises=RuntimeError("ntfy down"))
+
+    main.run_check(include_news_check=False)  # must not raise
+
+
+# --- backups --------------------------------------------------------------
+
+def test_a_run_backs_up_the_database(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert len(list((tmp_path / "backups").glob("*.db"))) == 1
+
+
+def test_backups_can_be_disabled(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("BACKUPS_KEPT", "0")
+    _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
+    _patch_notifiers(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert not (tmp_path / "backups").exists()

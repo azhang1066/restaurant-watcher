@@ -434,3 +434,33 @@ def test_connections_use_wal(tmp_path, monkeypatch):
     db.init_db()
     with db.get_conn() as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_backup_copies_the_database_and_keeps_only_the_newest(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "p1")
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    for stamp in ("20200101-000000", "20200102-000000", "20200103-000000"):
+        (folder / f"test-{stamp}.db").write_bytes(b"old")
+
+    target = db.backup_db(keep=2)
+
+    assert sorted(p.name for p in folder.glob("*.db")) == ["test-20200103-000000.db", target.name]
+    copy = sqlite3.connect(target)
+    assert copy.execute("SELECT name FROM restaurants").fetchone()[0] == "Lilia"
+    copy.close()
+
+
+def test_archive_flag_is_written_with_the_check_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "p1", verified=True)
+    rid = db.get_restaurant_by_place_id("p1")["id"]
+
+    db.update_check_result(rid, "CLOSED_PERMANENTLY", False, "", archive=True)
+
+    row = db.get_restaurant(rid)
+    assert row["archived"] == 1 and row["business_status"] == "CLOSED_PERMANENTLY"

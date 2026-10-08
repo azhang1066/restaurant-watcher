@@ -6,7 +6,7 @@ scheduler's import-time side effects (load_dotenv, logging.basicConfig).
 import logging
 
 from closure_checker import check_closing_soon
-from db import archive_restaurant, update_check_result
+from db import update_check_result
 from notifier import notify_closed, notify_closing_soon
 from places_client import get_business_status
 from statuses import CLOSED_PERMANENTLY, CLOSED_STATUSES, OPERATIONAL
@@ -103,12 +103,11 @@ def check_one(r, include_news_check=False):
     elif closing_soon and not r["closing_soon_flag"]:
         notify_closing_soon(r, summary)
 
-    update_check_result(r["id"], status, closing_soon, summary)
-
     # Archive on the status itself rather than on the transition, so a
     # place that reached CLOSED_PERMANENTLY by some path that skipped
-    # the notify above still leaves the active list. Idempotent.
-    if status == CLOSED_PERMANENTLY:
-        archive_restaurant(r["id"])
+    # the notify above still leaves the active list. Idempotent, and written
+    # in the same transaction as the result.
+    update_check_result(r["id"], status, closing_soon, summary,
+                        archive=status == CLOSED_PERMANENTLY)
 
     return {"status": status, "closing_soon": closing_soon, "news_failed": news_failed}
