@@ -78,8 +78,9 @@ Flat layout, one module per role:
   what the flag is for), but the flag then reflects the last news check, not the present.
 - **The restaurants-to-verify queue is manual.** Batch verify exists; there is no one-click "all",
   on purpose — ticking is the act of having looked at the address.
-- **Text Search has no type or location bias**, which is where most wrong matches come from.
-  `includedType: restaurant` and a location bias are the obvious cheap improvements.
+- **Text Search bias is soft.** It sends `includedType: restaurant` and, when `SEARCH_BIAS_LAT/LNG`
+  are set, a location bias circle. Both are preferences, not filters, so wrong matches are fewer
+  but the confirm step still matters.
 
 ## 5. Work plan
 
@@ -99,4 +100,4 @@ and replace the dev server with a WSGI server.
    — the serial loop's wall-clock time and cost at real length are still estimates.
 2. Set `HEALTHCHECK_URL` against a real monitor and confirm that stopping the scheduler alerts.
 3. Work down the verify queue in batches, looking at each address before ticking it.
-4. Try `includedType: restaurant` on Text Search to cut wrong matches at the source.
+4. Set `SEARCH_BIAS_LAT/LNG` in `.env` and watch whether wrong matches actually drop.

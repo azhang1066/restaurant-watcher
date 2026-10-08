@@ -61,6 +61,19 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str) -> float | None:
+    """The variable as a float, or None when it's unset, empty or not a number
+    (the last is logged)."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r isn't a number -- ignoring it.", name, raw)
+        return None
+
+
 def configure_logging() -> None:
     """Give the root logger handlers for the entry points: stderr, plus a
     rotating file (LOG_FILE, `off` to disable) so a scheduler run under cron or

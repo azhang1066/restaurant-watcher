@@ -7,13 +7,15 @@ to the Enterprise SKU.
 import logging
 from urllib.parse import quote
 
-from config import env_str
+from config import env_float, env_str
 from http_session import retrying_session
 from statuses import ALL_STATUSES, OPERATIONAL, UNSPECIFIED
 
 logger = logging.getLogger(__name__)
 
 PLACES_BASE = "https://places.googleapis.com/v1"
+
+MAX_BIAS_RADIUS_M = 50_000.0
 
 _session = retrying_session(("GET", "POST"))
 
@@ -44,6 +46,25 @@ def _raise_for_status(resp) -> None:
     resp.raise_for_status()
 
 
+def _location_bias() -> dict | None:
+    """A circle around SEARCH_BIAS_LAT/LNG, or None when it isn't configured.
+
+    A bias, not a restriction: a name typed with an explicit address elsewhere
+    still resolves there. Places caps the radius at 50 km.
+    """
+    lat = env_float("SEARCH_BIAS_LAT")
+    lng = env_float("SEARCH_BIAS_LNG")
+    if lat is None or lng is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        logger.warning("SEARCH_BIAS_LAT/LNG (%s, %s) is out of range -- ignoring it.", lat, lng)
+        return None
+    radius = env_float("SEARCH_BIAS_RADIUS_M")
+    if radius is None or not 0 < radius <= MAX_BIAS_RADIUS_M:
+        radius = MAX_BIAS_RADIUS_M
+    return {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": radius}}
+
+
 def find_place_id(name: str, address_hint: str = "") -> dict | None:
     """Resolve a restaurant name (+ optional address/neighborhood) to a place_id
     via Text Search. Used by seed.py and the dashboard's add form."""
@@ -54,7 +75,11 @@ def find_place_id(name: str, address_hint: str = "") -> dict | None:
         "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.googleMapsUri",
     }
     query = f"{name} {address_hint}".strip()
-    resp = _session.post(url, headers=headers, json={"textQuery": query}, timeout=15)
+    body: dict = {"textQuery": query, "includedType": "restaurant"}
+    bias = _location_bias()
+    if bias:
+        body["locationBias"] = bias
+    resp = _session.post(url, headers=headers, json=body, timeout=15)
     _raise_for_status(resp)
     places = resp.json().get("places", [])
     return places[0] if places else None

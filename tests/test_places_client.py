@@ -118,3 +118,60 @@ def test_the_place_id_is_quoted_into_the_url(monkeypatch):
     places_client.get_business_status("a/b?c")
 
     assert urls == [places_client.PLACES_BASE + "/places/a%2Fb%3Fc"]
+
+
+def _search_body(monkeypatch):
+    """The JSON body find_place_id() posts, with the Places call faked."""
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    bodies = []
+    monkeypatch.setattr(places_client._session, "post",
+                        lambda url, json=None, **kw: bodies.append(json) or _Resp(200, {}))
+    places_client.find_place_id("Lilia", "Brooklyn")
+    return bodies[0]
+
+
+def test_text_search_prefers_restaurants(monkeypatch):
+    monkeypatch.delenv("SEARCH_BIAS_LAT", raising=False)
+    monkeypatch.delenv("SEARCH_BIAS_LNG", raising=False)
+
+    body = _search_body(monkeypatch)
+
+    assert body["textQuery"] == "Lilia Brooklyn"
+    assert body["includedType"] == "restaurant"
+    assert "locationBias" not in body
+
+
+def test_text_search_adds_a_location_bias_when_configured(monkeypatch):
+    monkeypatch.setenv("SEARCH_BIAS_LAT", "40.7")
+    monkeypatch.setenv("SEARCH_BIAS_LNG", "-74.0")
+    monkeypatch.setenv("SEARCH_BIAS_RADIUS_M", "30000")
+
+    body = _search_body(monkeypatch)
+
+    assert body["locationBias"] == {"circle": {
+        "center": {"latitude": 40.7, "longitude": -74.0}, "radius": 30000.0}}
+
+
+@pytest.mark.parametrize("radius", [None, "0", "-5", "999999", "wide"])
+def test_a_bad_bias_radius_falls_back_to_the_maximum(monkeypatch, radius):
+    monkeypatch.setenv("SEARCH_BIAS_LAT", "40.7")
+    monkeypatch.setenv("SEARCH_BIAS_LNG", "-74.0")
+    if radius is None:
+        monkeypatch.delenv("SEARCH_BIAS_RADIUS_M", raising=False)
+    else:
+        monkeypatch.setenv("SEARCH_BIAS_RADIUS_M", radius)
+
+    body = _search_body(monkeypatch)
+
+    assert body["locationBias"]["circle"]["radius"] == places_client.MAX_BIAS_RADIUS_M
+
+
+@pytest.mark.parametrize("lat,lng", [("40.7", None), ("95", "-74"), ("abc", "-74")])
+def test_an_incomplete_or_invalid_bias_is_ignored(monkeypatch, lat, lng):
+    monkeypatch.setenv("SEARCH_BIAS_LAT", lat)
+    if lng is None:
+        monkeypatch.delenv("SEARCH_BIAS_LNG", raising=False)
+    else:
+        monkeypatch.setenv("SEARCH_BIAS_LNG", lng)
+
+    assert "locationBias" not in _search_body(monkeypatch)
