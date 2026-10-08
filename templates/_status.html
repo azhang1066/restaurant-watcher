@@ -43,8 +43,15 @@
         action="{{ url_for('check_now', restaurant_id=r.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="return_to" value="{{ return_to }}">
-    <button class="action" type="submit"
-            title="Ask Google whether this place is still open, now. Doesn't re-run the closing-soon news check -- that stays on the weekly schedule.">Check now</button>
+    {#- Cooling down: checked within CHECK_NOW_COOLDOWN_HOURS. The route
+        refuses the same press; this just doesn't offer it. -#}
+    {% if r.check_wait %}
+      <button class="action" type="submit" disabled
+              title="Checked recently. Available again in {{ r.check_wait }}.">Check now</button>
+    {% else %}
+      <button class="action" type="submit"
+              title="Ask Google whether this place is still open, now. Doesn't re-run the closing-soon news check -- that stays on the weekly schedule.">Check now</button>
+    {% endif %}
   </form>
 {%- endmacro %}
 

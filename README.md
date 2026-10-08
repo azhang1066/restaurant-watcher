@@ -135,6 +135,35 @@ The button is only offered where a scheduled run would act: not on an
 unverified restaurant (that gate exists so nothing is spent on a row nobody
 has confirmed) and not on an archived one (re-activate it first).
 
+#### Spending limits
+
+Both money-spending buttons are capped, so a stuck key or a runaway script can't
+run up a bill. All three settings live in `.env` (see `.env.example`):
+
+- `CHECK_NOW_COOLDOWN_HOURS` (default 24) -- Check now is disabled, and refused if
+  posted anyway, for a restaurant checked less than this long ago. That includes
+  the weekly run's check, since a second look minutes later buys nothing.
+- `DASHBOARD_CHECKS_PER_DAY` (default 50) and `DASHBOARD_SEARCHES_PER_DAY`
+  (default 25) -- rolling 24-hour caps on Check now and on the add-a-restaurant
+  search. Presses are counted before the call is made, so a request that fails
+  after Google bills it still counts. `0` removes a cap.
+
+Every POST form also locks its buttons once submitted (`static/app.js`), so a
+double-click can't send the request twice. That's a convenience, not a guard --
+the limits above are what actually bound spending.
+
+The scheduled run neither draws on these budgets nor is stopped by them: refusing
+a scheduled check would silently stop the watching. Claude is never called from
+the dashboard, so there is no Claude budget here.
+
+**Backstop at the provider** (not enforced by this code -- set these once in the
+consoles, so a bug here can't get around them):
+
+- Google Cloud Console → APIs & Services → Places API (New) → Quotas: lower
+  "requests per day" to a few times your list size, and add a billing budget
+  with an alert (Billing → Budgets & alerts).
+- Anthropic Console → Settings → Limits: set a monthly spend limit.
+
 ### Removing a restaurant
 
 Each row in the table ends with a **Delete** button: the restaurant stops

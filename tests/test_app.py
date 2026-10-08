@@ -33,6 +33,9 @@ import main
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_SECRET_KEY", "test-key")
+    # The fixtures check rows moments before pressing Check now, so the
+    # cooldown is off by default; the tests about it turn it back on.
+    monkeypatch.setenv("CHECK_NOW_COOLDOWN_HOURS", "0")
     db.init_db()
     return dashboard.create_app().test_client()
 
@@ -1533,3 +1536,99 @@ def test_an_unwritable_key_file_falls_back_to_a_process_key(monkeypatch):
 
     assert len(key) == 64
     assert dashboard._secret_key() != key
+
+
+# --- spending limits ----------------------------------------------------------
+
+
+def _set_last_checked(restaurant_id, delta):
+    stamp = (datetime.now(UTC) - delta).strftime("%Y-%m-%d %H:%M:%S")
+    with db.get_conn() as conn:
+        conn.execute("UPDATE restaurants SET last_checked_at = ? WHERE id = ?",
+                     (stamp, restaurant_id))
+
+
+def test_check_now_is_refused_inside_the_cooldown(client, monkeypatch):
+    monkeypatch.setenv("CHECK_NOW_COOLDOWN_HOURS", "24")
+    restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
+    _set_last_checked(restaurant_id, timedelta(hours=3))
+    places, _, _ = _patch_check(monkeypatch)
+
+    body = _text(_post_check(client, restaurant_id, follow_redirects=True))
+
+    assert places == []
+    assert "checked recently" in body
+    assert "21 hours" in body
+    assert db.spend_budget("check", 1)  # the refused press used no budget
+
+
+def test_check_now_is_allowed_after_the_cooldown(client, monkeypatch):
+    monkeypatch.setenv("CHECK_NOW_COOLDOWN_HOURS", "24")
+    restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
+    _set_last_checked(restaurant_id, timedelta(hours=25))
+    places, _, _ = _patch_check(monkeypatch)
+
+    _post_check(client, restaurant_id)
+
+    assert places == ["place-lilia"]
+
+
+def test_check_now_cooldown_defaults_to_24_hours(client, monkeypatch):
+    monkeypatch.delenv("CHECK_NOW_COOLDOWN_HOURS")
+    restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
+    places, _, _ = _patch_check(monkeypatch)
+
+    _post_check(client, restaurant_id)
+
+    assert places == []
+
+
+def test_check_now_button_is_disabled_during_the_cooldown(client, monkeypatch):
+    monkeypatch.setenv("CHECK_NOW_COOLDOWN_HOURS", "24")
+    _add("Lilia", "place-lilia", status="OPERATIONAL")  # checked just now
+
+    body = _text(client.get("/"))
+
+    assert re.search(r'<button[^>]*disabled[^>]*>Check now</button>', body)
+
+
+def test_check_now_stops_at_the_daily_limit(client, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_CHECKS_PER_DAY", "2")
+    ids = [_add(f"R{i}", f"place-{i}") for i in range(3)]
+    places, _, _ = _patch_check(monkeypatch)
+
+    bodies = [_text(_post_check(client, i, follow_redirects=True)) for i in ids]
+
+    assert places == ["place-0", "place-1"]
+    assert "Daily limit for Check now" in bodies[2]
+
+
+def test_add_search_stops_at_the_daily_limit(client, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_SEARCHES_PER_DAY", "1")
+    calls = _patch_search(monkeypatch)
+
+    _post_add(client, name="Lilia")
+    body = _text(_post_add(client, name="Don Angie", follow_redirects=True))
+
+    assert calls == [("Lilia", "")]
+    assert "Daily limit for searches" in body
+
+
+def test_an_empty_search_does_not_use_budget(client, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_SEARCHES_PER_DAY", "1")
+    calls = _patch_search(monkeypatch)
+
+    _post_add(client, name="  ")
+    _post_add(client, name="Lilia")
+
+    assert calls == [("Lilia", "")]
+
+
+def test_a_limit_of_zero_means_no_cap(client, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_SEARCHES_PER_DAY", "0")
+    calls = _patch_search(monkeypatch)
+
+    for _ in range(30):
+        _post_add(client, name="Lilia")
+
+    assert len(calls) == 30

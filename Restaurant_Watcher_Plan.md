@@ -18,11 +18,11 @@ Flat layout, one module per role:
 |---|---|
 | `main.py` | The weekly run: lock, retry pending alerts, check each verified restaurant, housekeeping, monitor ping. Also the scheduler. |
 | `checker.py` | `check_one()` — one restaurant's whole check; used by the scheduler and the dashboard's Check-now. |
-| `db.py` | Schema, versioned migrations, all SQL. Also the small `meta` and `pending_adds` tables. |
+| `db.py` | Schema, versioned migrations, all SQL. Also the small `meta`, `pending_adds` and `api_calls` (spend budget) tables. |
 | `places_client.py` | Google Places API (New): text search, status poll, typed errors. |
 | `closure_checker.py` | Claude + web search "closing soon" judgment. Raises when it can't read a verdict. |
 | `notifier.py` | ntfy + optional SMTP, healthcheck ping. |
-| `app.py`, `templates/`, `static/` | Flask dashboard. |
+| `app.py`, `templates/`, `static/` | Flask dashboard. `static/app.js` holds the delete confirm and the lock-on-submit for POST forms. |
 | `seed.py` | Bulk-add from a text file (rows land unverified). |
 | `config.py`, `statuses.py`, `http_session.py` | Env helpers + logging, status constants/labels, the shared retry policy. |
 
@@ -41,6 +41,12 @@ Flat layout, one module per role:
   (clearing it would re-arm an alert already sent); it never costs the Places status.
 - **Check-now is the cheap half only** (no Claude call, run counter untouched), and is offered only
   for rows a scheduled run would check — one rule, `checker.is_checkable()`.
+- **The spending buttons are bounded in layers.** Check now has a per-row cooldown (checked within
+  `CHECK_NOW_COOLDOWN_HOURS`, by anyone, is refused); Search and Check now each draw on a rolling
+  24-hour budget (`db.spend_budget`, counted *before* the call so a billed failure still counts);
+  forms lock their buttons on submit as a convenience. The budgets count dashboard presses only —
+  refusing a scheduled check would silently stop the watching, and the dashboard never calls Claude,
+  so there is no Claude budget. Provider quotas are the backstop (section 4).
 - **Destruction is graded:** archive (a closure; reversible), reject (an unverified wrong match;
   history deleted), delete (anything; confirm dialog, logged with the place_id).
 - **Watching the watcher.** A dead scheduler can't report itself: `HEALTHCHECK_URL` is pinged after
@@ -65,7 +71,10 @@ Flat layout, one module per role:
 - **No auth.** The dashboard binds to localhost and is served by Flask's dev server. That is fine
   until anyone wants it on a phone — at which point the list stops being local-only data, and the
   buttons that spend money (Search, Check now) and destroy history (Delete) stop being harmless.
-- **No rate limit** on the two spending buttons; bounded by how fast one person clicks.
+- **Provider-side spend caps are manual and unconfirmed.** The in-app limits (section 2) don't stop
+  a bug in the app or the scheduler itself. Set the Google Cloud Places quota + billing budget alert
+  and the Anthropic monthly limit (README, "Spending limits"), then delete this line. There is
+  still no per-IP rate limit, which only matters once the dashboard is exposed.
 - **Delete's confirm dialog is client-side**, so a browser with JavaScript off submits unasked.
   The route logs what it removed, place_id included.
 - **Serial checks.** One restaurant at a time, with retry backoff. Fine at the current size;
@@ -85,8 +94,7 @@ Flat layout, one module per role:
 
 ### Phase 1 — Auth (the blocker for serving beyond localhost)
 Needed before the dashboard is reachable from a phone. Settle the threat model first (single user,
-a reverse proxy with its own auth, or app-level login), then put rate limits on Search / Check now
-and replace the dev server with a WSGI server.
+a reverse proxy with its own auth, or app-level login), then add a per-IP rate limit on Search / Check now and replace the dev server with a WSGI server.
 
 ### Phase 2 — Scale polish (only once the list outgrows a serial loop)
 - Concurrency in the per-restaurant loop, or batched status checks if Places ever supports them.

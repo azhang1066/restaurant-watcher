@@ -59,14 +59,21 @@ import logging
 import math
 import secrets
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.wrappers import Response
 
 import db
 from checker import AlertNotSent, check_one, is_checkable
-from config import DASHBOARD_HOST, DASHBOARD_PORT, STALE_AFTER_DAYS, configure_logging, env_str
+from config import (
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    STALE_AFTER_DAYS,
+    configure_logging,
+    env_int,
+    env_str,
+)
 from db import (
     add_restaurant,
     check_history,
@@ -100,6 +107,21 @@ MAX_QUERY_CHARS = 120
 # unbounded page with a few hundred restaurants is a few hundred forms.
 PAGE_SIZE = 100
 PENDING_SHOWN = 50
+
+# Limits on the two buttons that spend money, each read at request time from
+# `.env` (0 turns it off). The budgets are rolling 24-hour counts of dashboard
+# presses -- the scheduler's own calls neither draw on them nor are blocked by
+# them, since refusing a scheduled check would silently stop the watching.
+DEFAULT_SEARCHES_PER_DAY = 25
+DEFAULT_CHECKS_PER_DAY = 50
+# Check now refuses a restaurant checked (by anyone) more recently than this.
+DEFAULT_CHECK_COOLDOWN_HOURS = 24
+
+
+def _check_cooldown() -> timedelta:
+    return timedelta(hours=max(0, env_int("CHECK_NOW_COOLDOWN_HOURS",
+                                          DEFAULT_CHECK_COOLDOWN_HOURS)))
+
 
 # Ids beyond SQLite's INTEGER range can't match a row and raise in the driver.
 _MAX_ID = 2**63 - 1
@@ -258,6 +280,9 @@ def _view(restaurant: dict, now: datetime) -> dict:
         # Whether to offer the Check-now button. Decided here, not in the
         # template, so it and the route's guard read the same rule.
         "checkable": is_checkable(restaurant),
+        # Set while the button is cooling down: the wait, spelled out for its
+        # tooltip. Same rule the route enforces (`_check_wait`).
+        "check_wait": (_duration(wait) if (wait := _check_wait(checked_at, now)) else None),
         "checked_at": checked_at,
         "checked_age": _age(checked_at, now),
         # Never checked is its own state, not a stale one -- a freshly seeded
@@ -267,6 +292,23 @@ def _view(restaurant: dict, now: datetime) -> dict:
         "needs_attention": (closing_soon or status in _ATTENTION_STATUSES
                             or needs_verification),
     }
+
+
+def _check_wait(checked_at: datetime | None, now: datetime) -> timedelta | None:
+    """How much longer Check now is off for a row, or None when it's allowed."""
+    if checked_at is None:
+        return None
+    remaining = checked_at + _check_cooldown() - now
+    return remaining if remaining > timedelta(0) else None
+
+
+def _duration(delta: timedelta) -> str:
+    """'3 hours' / '20 minutes', rounded up so it never promises too early."""
+    minutes = max(1, math.ceil(delta.total_seconds() / 60))
+    if minutes >= 60:
+        hours = math.ceil(minutes / 60)
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 def _sort_key(view: dict) -> tuple:
@@ -402,6 +444,21 @@ def check_now(restaurant_id: int):
     if not is_checkable(restaurant):
         abort(400, "That restaurant isn't being checked -- verify it, or "
                    "re-activate it, first.")
+
+    # Cooldown before budget: a refused press must not use up a slot. The page
+    # disables the button in this window, so this is a stale tab or a crafted
+    # post -- a message rather than a 4xx, as for the other already-done cases.
+    wait = _check_wait(_parse_ts(restaurant.get("last_checked_at")), datetime.now(UTC))
+    if wait:
+        flash(f"{restaurant['name']} was checked recently. Check now is "
+              f"available again in {_duration(wait)}.", "info")
+        return _back_to(restaurant_id)
+    if not db.spend_budget("check", env_int("DASHBOARD_CHECKS_PER_DAY", DEFAULT_CHECKS_PER_DAY)):
+        logger.warning("Daily Check now limit reached -- refused %s (id=%s)",
+                       restaurant["name"], restaurant_id)
+        flash("Daily limit for Check now reached. It frees up as presses age past "
+              "24 hours; the weekly run isn't affected.", "warn")
+        return _back_to(restaurant_id)
 
     previous = restaurant["business_status"]
     try:
@@ -595,6 +652,12 @@ def add_search():
         return redirect(url_for("index"))
 
     query = _query_label(name, hint)
+    if not db.spend_budget("search", env_int("DASHBOARD_SEARCHES_PER_DAY",
+                                             DEFAULT_SEARCHES_PER_DAY)):
+        logger.warning("Daily search limit reached -- refused %r", query)
+        flash("Daily limit for searches reached. It frees up as searches age past "
+              "24 hours.", "warn")
+        return redirect(url_for("index"))
     try:
         place = find_place_id(name, hint)
     except Exception:

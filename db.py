@@ -85,11 +85,19 @@ CREATE TABLE IF NOT EXISTS pending_adds (
     payload TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- One row per dashboard button press that spends money (see spend_budget).
+CREATE TABLE IF NOT EXISTS api_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    called_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Created after migrations rather than in SCHEMA: migrations 2 and 4 drop and
 # recreate tables, which takes their indexes with it.
 INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_api_calls_kind_time ON api_calls (kind, called_at);
 CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
 CREATE INDEX IF NOT EXISTS idx_check_log_restaurant_time
     ON check_log (restaurant_id, checked_at);
@@ -584,6 +592,37 @@ def set_meta(key: str, value) -> None:
         conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
                      "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                      (key, str(value)))
+
+
+API_CALL_WINDOW_HOURS = 24
+# Rows older than this are dropped on the next spend; only the window matters.
+API_CALL_RETAIN_DAYS = 7
+
+
+def spend_budget(kind: str, limit: int) -> bool:
+    """Claim one `kind` call from a rolling 24-hour budget of `limit`.
+
+    Returns True and records the call, or False and records nothing when
+    `limit` calls have already been made in the last 24 hours. A `limit` of 0
+    or less means no cap (the call is still recorded). The count and the insert
+    share one write-locked transaction, so two simultaneous presses can't both
+    take the last slot.
+
+    Recorded *before* the API call the caller is about to make: a request that
+    fails after Google has billed it still counts.
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM api_calls WHERE called_at < datetime('now', ?)",
+                     (f"-{API_CALL_RETAIN_DAYS} days",))
+        if limit > 0:
+            used = conn.execute(
+                "SELECT COUNT(*) FROM api_calls WHERE kind = ? AND called_at >= datetime('now', ?)",
+                (kind, f"-{API_CALL_WINDOW_HOURS} hours")).fetchone()[0]
+            if used >= limit:
+                return False
+        conn.execute("INSERT INTO api_calls (kind) VALUES (?)", (kind,))
+    return True
 
 
 def stash_pending_add(token: str, candidate: dict) -> None:

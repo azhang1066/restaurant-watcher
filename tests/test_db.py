@@ -598,3 +598,33 @@ def test_pending_adds_round_trip_and_expire():
 
     db.delete_pending_add("t2")
     assert db.get_pending_add("t2") is None
+
+
+def test_spend_budget_stops_at_the_limit():
+    db.init_db()
+    assert [db.spend_budget("search", 2) for _ in range(3)] == [True, True, False]
+
+
+def test_spend_budget_counts_each_kind_separately():
+    db.init_db()
+    assert db.spend_budget("search", 1)
+    assert db.spend_budget("check", 1)
+    assert not db.spend_budget("search", 1)
+
+
+def test_spend_budget_frees_up_after_24_hours():
+    db.init_db()
+    assert db.spend_budget("search", 1)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE api_calls SET called_at = datetime('now', '-25 hours')")
+    assert db.spend_budget("search", 1)
+
+
+def test_spend_budget_forgets_old_rows():
+    db.init_db()
+    db.spend_budget("search", 0)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE api_calls SET called_at = datetime('now', '-8 days')")
+    db.spend_budget("search", 0)
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0] == 1
