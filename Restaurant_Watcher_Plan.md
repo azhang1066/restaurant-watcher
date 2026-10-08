@@ -49,7 +49,8 @@ Flat layout, one module per role:
 
 ## 3. External services
 
-- **Google Places (New).** `places:searchText` (seed + add form) and `GET /places/{id}` (every run).
+- **Google Places (New).** `places:searchText` (seed + add form; sends `includedType: restaurant` plus an optional
+  `SEARCH_BIAS_LAT/LNG/RADIUS_M` location bias) and `GET /places/{id}` (every run).
   The status field mask stays at `id,businessStatus,displayName` on purpose — adding rating, hours
   and the like moves the whole call to the Enterprise SKU. 404 → `PlaceNotFound`; 401/403 →
   `PlacesAuthError` (aborts the run); an unknown status value is stored as `UNSPECIFIED`.
@@ -67,8 +68,6 @@ Flat layout, one module per role:
 - **No rate limit** on the two spending buttons; bounded by how fast one person clicks.
 - **Delete's confirm dialog is client-side**, so a browser with JavaScript off submits unasked.
   The route logs what it removed, place_id included.
-- **CSRF tokens live in a signed session cookie.** Without `DASHBOARD_SECRET_KEY` a per-process key
-  is generated and open pages need a reload after a restart.
 - **Serial checks.** One restaurant at a time, with retry backoff. Fine at the current size;
   the first thing to revisit is `concurrent.futures`, or per-restaurant cadence.
 - **The needs-verifying push repeats every run** while anything is unverified. By design (those

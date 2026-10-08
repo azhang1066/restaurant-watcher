@@ -42,9 +42,8 @@ history stay on the page, greyed out.
 
 Every POST is CSRF-checked in one `before_request` hook -- see `_require_csrf`
 -- against a token tied to the session. That needs a signing key, so set
-`DASHBOARD_SECRET_KEY` in `.env` to keep sessions across restarts; without one
-a per-process key is generated and an open tab's token stops matching when the
-server restarts. Pages load no inline script or style, and a Content-Security-
+`DASHBOARD_SECRET_KEY` in `.env` to choose the key; without one a generated
+key is kept in data/.dashboard_secret so an open tab's token survives a restart. Pages load no inline script or style, and a Content-Security-
 Policy header says so.
 
 There's deliberately no module-level `app`: Flask's loader finds the
@@ -65,6 +64,7 @@ from datetime import UTC, datetime
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.wrappers import Response
 
+import db
 from checker import AlertNotSent, check_one, is_checkable
 from config import DASHBOARD_HOST, DASHBOARD_PORT, STALE_AFTER_DAYS, configure_logging, env_str
 from db import (
@@ -110,6 +110,9 @@ _STATUS_BADGES = {OPERATIONAL: "ok", CLOSED_TEMPORARILY: "warn"}
 # Sort the worst news to the top of the list.
 _STATUS_RANK = {CLOSED_PERMANENTLY: 0, CLOSED_TEMPORARILY: 1, OPERATIONAL: 2}
 
+# Where a generated signing key is kept, beside the database.
+SECRET_KEY_FILE = ".dashboard_secret"
+
 _CSP = ("default-src 'none'; style-src 'self'; script-src 'self'; "
         "img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 
@@ -117,16 +120,32 @@ _CSP = ("default-src 'none'; style-src 'self'; script-src 'self'; "
 def _secret_key() -> str:
     """Signing key for the session cookie the CSRF token lives in.
 
-    A generated key is fine for a personal localhost tool -- it only means
-    tokens don't outlive a restart -- but it's logged, because silently
-    invalidating sessions on every reload is confusing if you didn't expect it.
+    `DASHBOARD_SECRET_KEY` wins. Without one, a generated key is kept in a file
+    beside the database so open pages survive a restart; only if that file
+    can't be read or written does it fall back to a per-process key (logged,
+    because silently invalidating sessions on every reload is confusing).
     """
     key = env_str("DASHBOARD_SECRET_KEY")
     if key:
         return key
-    logger.info("No DASHBOARD_SECRET_KEY set -- generating a per-process key. "
-                "Open pages will need a reload after a restart.")
-    return secrets.token_hex(32)
+    path = db.DB_PATH.parent / SECRET_KEY_FILE
+    try:
+        stored = path.read_text(encoding="utf-8").strip()
+        if stored:
+            return stored
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("Couldn't read %s", path)
+    key = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(key, encoding="utf-8")
+        path.chmod(0o600)
+    except OSError:
+        logger.warning("No DASHBOARD_SECRET_KEY set and %s isn't writable -- using a "
+                       "per-process key. Open pages will need a reload after a restart.", path)
+    return key
 
 
 def _csrf_token() -> str:

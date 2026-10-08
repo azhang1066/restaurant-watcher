@@ -220,9 +220,9 @@ gets archived again by the next check; the page says so when you click it.
 
 Every POST is CSRF-checked by one hook (a route added later is covered by
 default), against a token tied to the session cookie, so set
-`DASHBOARD_SECRET_KEY` in `.env` if you want tokens to survive a restart.
-Without it a key is generated per process and an open page just needs a
-reload after the server restarts. Pages load no inline script or style, and
+`DASHBOARD_SECRET_KEY` in `.env` to choose the key. Without it a key is
+generated once and kept in `data/.dashboard_secret`, so an open page survives
+a restart (delete the file to rotate it). Pages load no inline script or style, and
 send a Content-Security-Policy saying so.
 
 It binds to localhost and has no auth or login, so don't expose it to a

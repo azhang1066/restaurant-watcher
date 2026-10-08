@@ -1505,3 +1505,31 @@ def test_check_now_reports_an_alert_that_could_not_be_sent(client, monkeypatch):
     body = response.get_data(as_text=True)
     assert "alert couldn&#39;t be sent" in body
     assert "nothing was changed" not in body
+
+
+def test_a_generated_secret_key_survives_a_restart(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_SECRET_KEY", raising=False)
+
+    first = dashboard._secret_key()
+
+    assert dashboard._secret_key() == first
+    assert (db.DB_PATH.parent / dashboard.SECRET_KEY_FILE).read_text() == first
+
+
+def test_the_env_secret_key_wins_over_the_stored_one(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_SECRET_KEY", raising=False)
+    dashboard._secret_key()
+    monkeypatch.setenv("DASHBOARD_SECRET_KEY", "from-env")
+
+    assert dashboard._secret_key() == "from-env"
+
+
+def test_an_unwritable_key_file_falls_back_to_a_process_key(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_SECRET_KEY", raising=False)
+    # A directory where the file should be: read and write both fail.
+    (db.DB_PATH.parent / dashboard.SECRET_KEY_FILE).mkdir()
+
+    key = dashboard._secret_key()
+
+    assert len(key) == 64
+    assert dashboard._secret_key() != key
