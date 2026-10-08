@@ -20,6 +20,7 @@ coming back.
 """
 import logging
 
+import checker
 import db
 import main
 
@@ -66,7 +67,7 @@ def _patch_places(monkeypatch, by_place_id):
             raise result
         return result
 
-    monkeypatch.setattr(main, "get_business_status", _fake)
+    monkeypatch.setattr(checker, "get_business_status", _fake)
     return calls
 
 
@@ -84,7 +85,7 @@ def _patch_news(monkeypatch, by_name=None):
             raise result
         return result
 
-    monkeypatch.setattr(main, "check_closing_soon", _fake)
+    monkeypatch.setattr(checker, "check_closing_soon", _fake)
     return calls
 
 
@@ -96,8 +97,8 @@ def _patch_notifiers(monkeypatch, closed_raises=None):
             raise closed_raises
         closed.append((restaurant["name"], status))
 
-    monkeypatch.setattr(main, "notify_closed", _closed)
-    monkeypatch.setattr(main, "notify_closing_soon",
+    monkeypatch.setattr(checker, "notify_closed", _closed)
+    monkeypatch.setattr(checker, "notify_closing_soon",
                         lambda r, summary: closing_soon.append((r["name"], summary)))
     return closed, closing_soon
 

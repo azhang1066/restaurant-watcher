@@ -1,6 +1,8 @@
 """State-transition tests for db.py -- these are the easiest thing in this
 repo to regress silently since main.py relies on exact field values
 (business_status, closing_soon_flag, archived) to decide when to notify."""
+import pytest
+
 import db
 
 
@@ -316,8 +318,99 @@ def test_migration_verifies_rows_that_were_already_being_checked(tmp_path, monke
                         VALUES ('Watched', 'place-watched', '2020-01-01 12:00:00')""")
         conn.execute("""INSERT INTO restaurants (name, place_id)
                         VALUES ('Seeded but never checked', 'place-fresh')""")
+        # A real pre-migration database has never heard of schema versions.
+        conn.execute("PRAGMA user_version = 0")
 
     db.init_db()
 
     assert db.get_restaurant_by_place_id("place-watched")["verified_at"] is not None
     assert db.get_restaurant_by_place_id("place-fresh")["verified_at"] is None
+
+
+def _version(tmp_path):
+    with db.get_conn() as conn:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def test_fresh_database_is_stamped_with_the_latest_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+
+    assert _version(tmp_path) == db.SCHEMA_VERSION
+
+
+def test_constraint_migration_keeps_rows_ids_and_history(tmp_path, monkeypatch):
+    """Migration 2 drops and recreates `restaurants`. The ids have to survive
+    or every check_log row would describe a different restaurant."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia", verified=True)
+    rid = db.get_restaurant_by_place_id("place-lilia")["id"]
+    db.update_check_result(rid, "CLOSED_TEMPORARILY", True, "closing")
+    with db.get_conn() as conn:
+        # Back to the unconstrained v1 table.
+        conn.execute("ALTER TABLE restaurants RENAME TO restaurants_old")
+        conn.execute("""CREATE TABLE restaurants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            place_id TEXT UNIQUE NOT NULL, address TEXT, maps_url TEXT,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            business_status TEXT DEFAULT 'OPERATIONAL',
+            closing_soon_flag INTEGER DEFAULT 0, closing_soon_summary TEXT,
+            last_checked_at TEXT, archived INTEGER DEFAULT 0, verified_at TEXT)""")
+        conn.execute("INSERT INTO restaurants SELECT * FROM restaurants_old")
+        conn.execute("DROP TABLE restaurants_old")
+        conn.execute("PRAGMA user_version = 1")
+
+    db.init_db()
+
+    row = db.get_restaurant(rid)
+    assert (row["name"], row["business_status"], row["closing_soon_flag"]) == (
+        "Lilia", "CLOSED_TEMPORARILY", 1)
+    assert [h["checks"] for h in db.check_history(rid)] == [1]
+    assert _version(tmp_path) == db.SCHEMA_VERSION
+
+
+def test_init_db_is_idempotent_once_migrated(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia")
+
+    db.init_db()
+    db.init_db()
+
+    assert len(db.list_restaurants()) == 1
+
+
+def test_a_nonsense_status_is_refused_by_the_database(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia")
+    rid = db.get_restaurant_by_place_id("place-lilia")["id"]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.update_check_result(rid, "CLOSED_FOREVER", False, "")
+
+
+def test_a_bad_row_aborts_the_constraint_migration_and_loses_nothing(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    db.init_db()
+    with db.get_conn() as conn:
+        conn.execute("DROP TABLE restaurants")
+        conn.execute("""CREATE TABLE restaurants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            place_id TEXT UNIQUE NOT NULL, address TEXT, maps_url TEXT,
+            added_at TEXT, business_status TEXT, closing_soon_flag INTEGER,
+            closing_soon_summary TEXT, last_checked_at TEXT, archived INTEGER,
+            verified_at TEXT)""")
+        conn.execute("""INSERT INTO restaurants (name, place_id, business_status)
+                        VALUES ('Odd', 'place-odd', 'SOMETHING_NEW')""")
+        conn.execute("PRAGMA user_version = 1")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.init_db()
+
+    assert _version(tmp_path) == 1
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM restaurants").fetchone()[0] == 1

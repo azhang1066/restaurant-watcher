@@ -8,9 +8,8 @@ import smtplib
 from email.header import Header
 from email.message import EmailMessage
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from http_session import retrying_session
+from statuses import CLOSED_PERMANENTLY
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +21,7 @@ DEFAULT_DASHBOARD_URL = "http://127.0.0.1:5000"
 # can leave a hundred restaurants waiting at once.
 NAMES_IN_VERIFY_PUSH = 5
 
-_session = requests.Session()
-_retry = Retry(
-    total=3,
-    backoff_factor=0.5,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=("POST",),
-)
-_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session = retrying_session(("POST",))
 
 
 def _ntfy_url():
@@ -113,7 +105,7 @@ def _send_email(subject, message, url=None):
 
 
 def notify_closed(restaurant, status):
-    label = "permanently closed" if status == "CLOSED_PERMANENTLY" else "temporarily closed"
+    label = "permanently closed" if status == CLOSED_PERMANENTLY else "temporarily closed"
     notify(
         title=f"🚫 {restaurant['name']} is {label}",
         message=f"{restaurant.get('address', '')}".strip() or "No address on file.",

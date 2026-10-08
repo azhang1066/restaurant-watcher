@@ -25,6 +25,7 @@ import pytest
 
 import app as dashboard
 import db
+import checker
 import main
 
 
@@ -1061,7 +1062,7 @@ def test_delete_button_round_trips_a_token_from_the_rendered_page(client):
 
 # --- checking a restaurant now -------------------------------------------
 #
-# The button runs main.check_one, the same function the weekly run calls, so
+# The button runs checker.check_one, the same function the weekly run calls, so
 # these tests are mostly about the two things the route adds around it: that
 # it is offered and honoured for exactly the rows a scheduled run would check,
 # and that it stays on the cheap half. Several assert the news check didn't
@@ -1078,8 +1079,8 @@ def _post_check(client, restaurant_id, token=None, follow_redirects=False, **fie
 def _patch_check(monkeypatch, status="OPERATIONAL"):
     """Fake everything check_one reaches for, and record it.
 
-    Patched on `main`, not on `app`: the dashboard imports check_one, and that
-    function resolves these names in main's globals. Patching the wrong module
+    Patched on `checker`, not on `app`: the dashboard imports check_one, and that
+    function resolves these names in checker's globals. Patching the wrong module
     would leave the real Places call in place, which is the failure mode worth
     being explicit about.
 
@@ -1102,11 +1103,11 @@ def _patch_check(monkeypatch, status="OPERATIONAL"):
         news.append(name)
         return {"closing_soon": True, "confidence": "high", "summary": "from the news"}
 
-    monkeypatch.setattr(main, "get_business_status", _fake_status)
-    monkeypatch.setattr(main, "check_closing_soon", _fake_news)
-    monkeypatch.setattr(main, "notify_closed",
+    monkeypatch.setattr(checker, "get_business_status", _fake_status)
+    monkeypatch.setattr(checker, "check_closing_soon", _fake_news)
+    monkeypatch.setattr(checker, "notify_closed",
                         lambda r, s: notifications.append(("closed", r["name"], s)))
-    monkeypatch.setattr(main, "notify_closing_soon",
+    monkeypatch.setattr(checker, "notify_closing_soon",
                         lambda r, summary: notifications.append(("soon", r["name"])))
     return places, news, notifications
 

@@ -5,20 +5,13 @@ Avoid adding rating/hours/photos/phone fields here; those bump every call
 to the Enterprise SKU.
 """
 import os
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from http_session import retrying_session
+from statuses import OPERATIONAL
 
 PLACES_BASE = "https://places.googleapis.com/v1"
 
-_session = requests.Session()
-_retry = Retry(
-    total=3,
-    backoff_factor=0.5,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=("GET", "POST"),
-)
-_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session = retrying_session(("GET", "POST"))
 
 
 def _api_key():
@@ -70,4 +63,4 @@ def get_business_status(place_id):
     resp = _session.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("businessStatus", "OPERATIONAL")
+    return data.get("businessStatus", OPERATIONAL)

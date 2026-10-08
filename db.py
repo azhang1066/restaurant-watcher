@@ -3,23 +3,32 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from statuses import ALL_STATUSES, CLOSED_PERMANENTLY, OPERATIONAL
+
 DB_PATH = Path(__file__).parent / "data" / "restaurants.db"
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS restaurants (
+_STATUS_LIST = ", ".join(f"'{s}'" for s in ALL_STATUSES)
+
+# The restaurants table as of the latest schema version. Also what migration 2
+# rebuilds an older table into, so there is one definition of it, not two.
+_RESTAURANTS_COLUMNS = f"""
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     place_id TEXT UNIQUE NOT NULL,
     address TEXT,
     maps_url TEXT,
     added_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    business_status TEXT DEFAULT 'OPERATIONAL',   -- OPERATIONAL / CLOSED_TEMPORARILY / CLOSED_PERMANENTLY
-    closing_soon_flag INTEGER DEFAULT 0,           -- 1 if news check found a closure signal
+    business_status TEXT DEFAULT '{OPERATIONAL}'
+        CHECK (business_status IN ({_STATUS_LIST})),
+    closing_soon_flag INTEGER DEFAULT 0 CHECK (closing_soon_flag IN (0, 1)),   -- 1 if news check found a closure signal
     closing_soon_summary TEXT,
     last_checked_at TEXT,
-    archived INTEGER DEFAULT 0,                    -- 1 once we've notified + user has acknowledged
+    archived INTEGER DEFAULT 0 CHECK (archived IN (0, 1)),                     -- 1 once we've notified + user has acknowledged
     verified_at TEXT                               -- when the user confirmed this place_id is the right location; NULL until then
-);
+"""
+
+SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS restaurants ({_RESTAURANTS_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS check_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +61,12 @@ CREATE TABLE IF NOT EXISTS check_log_monthly (
 );
 """
 
+# Created after migrations rather than in SCHEMA: migration 2 drops and
+# recreates the restaurants table, which takes its indexes with it.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
+"""
+
 DEFAULT_RETAIN_DAYS = 90
 
 
@@ -67,31 +82,71 @@ def get_conn():
         conn.close()
 
 
-def _migrate(conn):
-    """Add columns the schema gained after rows already existed.
+def _migrate_1_add_verified_at(conn):
+    """Add `verified_at` to a table that predates it, backfilling anything
+    already being watched.
 
-    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a new
-    column has to be ALTERed in. Guarded by a lookup rather than a version
-    number: there is one of these, and a `PRAGMA` is cheaper than a table to
-    track it.
+    Unverified rows are skipped by run_check, so treating a restaurant that
+    has been checked for months as suddenly unverified would silently stop
+    watching it -- and there is nothing new to tell the user about a place
+    they have been reading alerts about. Never-checked rows keep the NULL and
+    get asked about, which is exactly the new behaviour.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")}
-    if "verified_at" not in columns:
-        conn.execute("ALTER TABLE restaurants ADD COLUMN verified_at TEXT")
-        # Backfill anything already being watched. Unverified rows are
-        # skipped by run_check, so treating a restaurant that has been
-        # checked for months as suddenly unverified would silently stop
-        # watching it -- and there is nothing new to tell the user about a
-        # place they have been reading alerts about. Never-checked rows keep
-        # the NULL and get asked about, which is exactly the new behaviour.
-        conn.execute("""UPDATE restaurants SET verified_at = COALESCE(added_at, CURRENT_TIMESTAMP)
-                        WHERE verified_at IS NULL AND last_checked_at IS NOT NULL""")
+    if "verified_at" in columns:
+        return
+    conn.execute("ALTER TABLE restaurants ADD COLUMN verified_at TEXT")
+    conn.execute("""UPDATE restaurants SET verified_at = COALESCE(added_at, CURRENT_TIMESTAMP)
+                    WHERE verified_at IS NULL AND last_checked_at IS NOT NULL""")
+
+
+def _migrate_2_add_constraints(conn):
+    """Rebuild `restaurants` so status and flag columns carry CHECK constraints.
+
+    SQLite can't add a CHECK to an existing table, so this is the documented
+    create-copy-drop-rename. Row ids are copied across, so `check_log` and
+    `check_log_monthly` keep pointing at the right rows. A row that violates
+    a constraint aborts the whole migration (nothing is committed) rather
+    than being quietly dropped or rewritten.
+    """
+    names = [row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")]
+    cols = ", ".join(names)
+    conn.execute(f"CREATE TABLE restaurants_new ({_RESTAURANTS_COLUMNS})")
+    conn.execute(f"INSERT INTO restaurants_new ({cols}) SELECT {cols} FROM restaurants")
+    conn.execute("DROP TABLE restaurants")
+    conn.execute("ALTER TABLE restaurants_new RENAME TO restaurants")
+
+
+# Schema version N lives in `PRAGMA user_version`; _MIGRATIONS[N-1] takes a
+# database from version N-1 to N. Append to the list to add one -- each runs
+# once, in order, inside a transaction.
+_MIGRATIONS = [_migrate_1_add_verified_at, _migrate_2_add_constraints]
+SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+def _migrate(conn):
+    """Bring an existing database up to SCHEMA_VERSION."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for number in range(version + 1, SCHEMA_VERSION + 1):
+        conn.execute("BEGIN")
+        _MIGRATIONS[number - 1](conn)
+        # PRAGMA doesn't take parameters; `number` is an int we control.
+        conn.execute(f"PRAGMA user_version = {number}")
+        conn.execute("COMMIT")
 
 
 def init_db():
     with get_conn() as conn:
+        fresh = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'restaurants'"
+        ).fetchone() is None
         conn.executescript(SCHEMA)
-        _migrate(conn)
+        if fresh:
+            # SCHEMA is already the latest shape; nothing to migrate.
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        else:
+            _migrate(conn)
+        conn.executescript(INDEXES)
         # Settle any closing-soon flag left set on a permanently closed row.
         # main.run_check() clears the flag as the closure lands, but rows
         # written before it did that are unreachable by it: a permanent
@@ -100,7 +155,8 @@ def init_db():
         # migration to track.
         conn.execute(
             """UPDATE restaurants SET closing_soon_flag = 0
-               WHERE business_status = 'CLOSED_PERMANENTLY' AND closing_soon_flag = 1"""
+               WHERE business_status = ? AND closing_soon_flag = 1""",
+            (CLOSED_PERMANENTLY,),
         )
 
 
@@ -155,7 +211,7 @@ def get_restaurant_by_place_id(place_id):
     return dict(row) if row else None
 
 
-def update_check_result(restaurant_id, business_status, closing_soon_flag, closing_soon_summary, notes=""):
+def update_check_result(restaurant_id, business_status, closing_soon_flag, closing_soon_summary):
     with get_conn() as conn:
         conn.execute(
             """UPDATE restaurants
@@ -165,9 +221,9 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag, closi
             (business_status, int(closing_soon_flag), closing_soon_summary, restaurant_id),
         )
         conn.execute(
-            """INSERT INTO check_log (restaurant_id, business_status, closing_soon_flag, notes)
-               VALUES (?, ?, ?, ?)""",
-            (restaurant_id, business_status, int(closing_soon_flag), notes),
+            """INSERT INTO check_log (restaurant_id, business_status, closing_soon_flag)
+               VALUES (?, ?, ?)""",
+            (restaurant_id, business_status, int(closing_soon_flag)),
         )
 
 
@@ -199,38 +255,29 @@ def unarchive_restaurant(restaurant_id):
     return changed > 0
 
 
-def verify_restaurant(restaurant_id):
-    """Record that the user confirmed this row points at the right place.
-
-    Returns True if a row was newly verified, False if it was already
-    verified or doesn't exist. The timestamp is only ever written once, so a
-    double-submitted form reports the repeat rather than moving the date.
-    """
-    with get_conn() as conn:
-        changed = conn.execute(
-            """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND verified_at IS NULL""",
-            (restaurant_id,),
-        ).rowcount
-    return changed > 0
-
-
 def verify_restaurants(restaurant_ids):
-    """Verify several rows in one transaction. Returns how many were newly
-    verified; ids that are unknown or already verified are skipped, exactly as
-    verify_restaurant() skips them one at a time."""
+    """Record that the user confirmed these rows point at the right place, in
+    one transaction. Returns how many were newly verified.
+
+    The timestamp is only ever written once, so ids that are unknown or
+    already verified are skipped -- a double-submitted form reports the repeat
+    rather than moving the date.
+    """
     ids = [(i,) for i in restaurant_ids]
     if not ids:
         return 0
     with get_conn() as conn:
-        changed = 0
-        for params in ids:
-            changed += conn.execute(
-                """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
-                   WHERE id = ? AND verified_at IS NULL""",
-                params,
-            ).rowcount
-    return changed
+        return conn.executemany(
+            """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND verified_at IS NULL""",
+            ids,
+        ).rowcount
+
+
+def verify_restaurant(restaurant_id):
+    """verify_restaurants() for one row: True if it was newly verified, False
+    if it was already verified or doesn't exist."""
+    return verify_restaurants([restaurant_id]) > 0
 
 
 def delete_restaurant(restaurant_id):

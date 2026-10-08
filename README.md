@@ -14,7 +14,8 @@ place's status on a schedule rather than syncing the list itself.
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt        # runtime
+# pip install -r requirements-dev.txt   # adds pytest, to run the tests
 cp .env.example .env   # fill in your keys
 ```
 
@@ -203,7 +204,7 @@ see [Verifying a restaurant](#verifying-a-restaurant).
 
 The dashboard's **Check now** button runs step 1 on a single restaurant,
 never step 2 -- see [Checking a restaurant now](#checking-a-restaurant-now).
-Both paths go through the same `main.check_one()`, so a manual check writes,
+Both paths go through the same `checker.check_one()`, so a manual check writes,
 alerts and archives exactly as a scheduled one does.
 
 Permanent closures auto-archive the restaurant after notifying; temporary

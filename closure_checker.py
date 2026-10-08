@@ -5,9 +5,15 @@ hard API field, so it's run less often than the Places status check
 (e.g. monthly, not weekly) to keep cost and noise down.
 """
 import json
+import os
+
 import anthropic
 
+# Default model and server-side tool version. Both are API identifiers that
+# get retired, so the model can be overridden from `.env` (CLOSURE_CHECK_MODEL)
+# without a code change, and the tool type has one definition to update.
 MODEL = "claude-sonnet-4-6"
+WEB_SEARCH_TOOL = "web_search_20250305"
 
 # The SDK runs its own retry loop (exponential backoff, honors `retry-after`,
 # covers connection/timeout errors plus 408/409/429/5xx), so there is no
@@ -30,6 +36,11 @@ Respond with ONLY a JSON object, no other text, in this exact shape:
 """
 
 
+def _model():
+    """Read at call time for the same reason as `_client()`."""
+    return os.environ.get("CLOSURE_CHECK_MODEL") or MODEL
+
+
 def _client():
     """Built at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern. Reads
@@ -41,9 +52,9 @@ def check_closing_soon(name, address):
     """Raises if the API is still failing once the SDK's retries are spent --
     `main.run_check` decides what a dead news check means for the run."""
     resp = _client().messages.create(
-        model=MODEL,
+        model=_model(),
         max_tokens=500,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        tools=[{"type": WEB_SEARCH_TOOL, "name": "web_search"}],
         messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(name=name, address=address or "")}],
     )
 
