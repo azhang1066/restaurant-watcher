@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Delete {{ restaurant.name }} &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Stop watching {{ restaurant.name }}?</h1>
+  <p class="sub">Its row and check history will be deleted, and this cannot be
+    undone. To keep the history, leave it be &mdash; a closed place archives itself.</p>
+
+  <div class="card pad">
+    <p class="name tight-p">{{ restaurant.name }}</p>
+    {% if restaurant.address %}
+      <p class="muted small m0">{{ restaurant.address }}</p>
+    {% endif %}
+  </div>
+
+  <form class="mt-xl" method="post"
+        action="{{ url_for('delete', restaurant_id=restaurant.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="action danger" type="submit">Yes, delete it</button>
+    <a class="small ml-s" href="{{ url_for('index') }}">Cancel</a>
+  </form>
+{% endblock %}

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_status.html" import badges, check_form, delete_form, unarchive_form, verify_forms %}
+{% from "_status.html" import badges, check_form, delete_link,unarchive_form, verify_forms %}
 
 {% block content %}
   <h1>Restaurant Watcher</h1>
@@ -136,10 +136,10 @@
                 away from the restaurant's own link, and stays reachable. Check
                 now sits to its left rather than beside the status it refreshes,
                 so the rightmost thing under the pointer is still the one that
-                asks before it acts. -#}
+                asks before it acts (it opens a confirmation page). -#}
             <td class="keep actions">
               {% if r.checkable %}{{ check_form(r, 'index') }}{% endif %}
-              {{ delete_form(r) }}
+              {{ delete_link(r) }}
             </td>
           </tr>
         {% else %}

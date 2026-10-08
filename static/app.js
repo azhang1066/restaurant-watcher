@@ -3,22 +3,12 @@
 (function () {
   "use strict";
 
-  // Delete asks first. The restaurant's name travels as a data attribute, so
-  // it reaches the dialog as plain text -- no string-escaping to get wrong.
-  document.addEventListener("submit", function (e) {
-    var name = e.target.getAttribute("data-confirm-delete");
-    if (name === null) { return; }
-    if (!confirm("Stop watching " + name + "? Its check history will be " +
-                 "deleted too, and this cannot be undone.")) {
-      e.preventDefault();
-    }
-  });
-
   // One press per POST. Once a form is on its way its buttons go dead and a
   // second submit (double-click, Enter held down) is dropped, so a slow Places
-  // call can't be paid for twice. Registered after the confirm handlers above,
-  // so a cancelled dialog (defaultPrevented) leaves the form usable. Only a
-  // convenience: the server-side limits are the real guard.
+  // call can't be paid for twice. The bulk-verify confirm below listens on the
+  // form itself, so it runs first and a cancelled dialog (defaultPrevented)
+  // leaves the form usable. Only a convenience: the server-side limits are the
+  // real guard.
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (e.defaultPrevented || form.method.toLowerCase() !== "post") { return; }

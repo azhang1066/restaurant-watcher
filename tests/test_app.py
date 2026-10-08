@@ -957,28 +957,42 @@ def test_every_row_offers_a_delete_button(client):
     assert body.count(">Delete<") == 2
 
 
-def test_delete_button_asks_for_confirmation(client):
-    _add("Lilia", "place-lilia")
+def test_delete_button_leads_to_a_confirmation_page_not_a_post(client):
+    """No JavaScript involved: the button is a plain link to a GET page."""
+    restaurant_id = _add("Lilia", "place-lilia")
 
     body = client.get("/").get_data(as_text=True)
 
-    assert "data-confirm-delete=" in body
-    js = client.get("/static/app.js").get_data(as_text=True)
-    assert "confirm(" in js
-    assert "cannot be undone" in js
+    assert f'href="/restaurant/{restaurant_id}/delete"' in body
+    assert "data-confirm-delete" not in body
 
 
-def test_delete_confirmation_survives_an_apostrophe_in_the_name(client):
-    """The name rides in a data attribute that app.js reads back as text, so
-    there is no JavaScript string for a quote to end early. Autoescaping has
-    to keep it from ending the *attribute* instead."""
-    _add("Katz's Delicatessen", "place-katz")
-    _add('Say "Hi" <b>', "place-hi")
+def test_delete_confirmation_page_names_the_restaurant_and_deletes_nothing(client):
+    restaurant_id = _add("Lilia", "place-lilia")
 
-    body = client.get("/").get_data(as_text=True)
+    response = client.get(f"/restaurant/{restaurant_id}/delete")
+    body = _text(response)
 
-    assert 'data-confirm-delete="Katz&#39;s Delicatessen"' in body
-    assert 'data-confirm-delete="Say &#34;Hi&#34; &lt;b&gt;"' in body
+    assert response.status_code == 200
+    assert "Stop watching Lilia?" in body
+    assert "cannot be undone" in " ".join(body.split())
+    assert f'action="/restaurant/{restaurant_id}/delete"' in response.get_data(as_text=True)
+    assert db.get_restaurant(restaurant_id) is not None
+
+
+def test_delete_confirmation_escapes_the_name(client):
+    restaurant_id = _add('Say "Hi" <b>', "place-hi")
+
+    body = client.get(f"/restaurant/{restaurant_id}/delete").get_data(as_text=True)
+
+    assert "<b>" not in body
+    assert "Say &#34;Hi&#34; &lt;b&gt;" in body
+
+
+def test_delete_confirmation_of_a_missing_restaurant_goes_to_the_list(client):
+    response = client.get("/restaurant/999/delete", follow_redirects=True)
+
+    assert "had already been removed" in _text(response)
 
 
 def test_delete_removes_the_restaurant_and_its_history(client):
@@ -1002,7 +1016,7 @@ def test_delete_leaves_the_other_restaurants_alone(client):
 
 def test_delete_works_on_a_verified_restaurant(client):
     """Unlike /reject, which guards a confirmed row against a stale tab. Here
-    deleting one is the entire point, and the dialog is the guard."""
+    deleting one is the entire point, and the confirmation page is the guard."""
     restaurant_id = _add("Lilia", "place-lilia")
     assert db.get_restaurant(restaurant_id)["verified_at"] is not None
 
@@ -1032,10 +1046,11 @@ def test_delete_requires_a_csrf_token(client):
     assert db.get_restaurant(restaurant_id) is not None
 
 
-def test_delete_is_unreachable_by_get(client):
+def test_delete_by_get_never_deletes(client):
     restaurant_id = _add("Lilia", "place-lilia")
 
-    assert client.get(f"/restaurant/{restaurant_id}/delete").status_code == 405
+    client.get(f"/restaurant/{restaurant_id}/delete")
+
     assert db.get_restaurant(restaurant_id) is not None
 
 
@@ -1054,7 +1069,7 @@ def test_delete_button_round_trips_a_token_from_the_rendered_page(client):
     """The POSTs above seed the session, so nothing else here would notice the
     form and the check disagreeing about the field name."""
     restaurant_id = _add("Lilia", "place-lilia")
-    body = client.get("/").get_data(as_text=True)
+    body = client.get(f"/restaurant/{restaurant_id}/delete").get_data(as_text=True)
     token = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
 
     client.post(f"/restaurant/{restaurant_id}/delete", data={"csrf_token": token})

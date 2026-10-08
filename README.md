@@ -167,9 +167,10 @@ consoles, so a bug here can't get around them):
 ### Removing a restaurant
 
 Each row in the table ends with a **Delete** button: the restaurant stops
-being checked, and its row and check history are removed. The browser asks
-you to confirm by name first, because nothing here can put it back -- only
-the log line records what went, place_id included.
+being checked, and its row and check history are removed. The button opens a
+confirmation page naming the restaurant (server-side, so it works with
+JavaScript off), because nothing here can put it back -- only the log line
+records what went, place_id included.
 
 Deleting is for somewhere you no longer care about. **Archiving** is the
 softer option and the one a permanent closure triggers by itself: the row

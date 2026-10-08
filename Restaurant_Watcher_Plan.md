@@ -75,8 +75,6 @@ Flat layout, one module per role:
   a bug in the app or the scheduler itself. Set the Google Cloud Places quota + billing budget alert
   and the Anthropic monthly limit (README, "Spending limits"), then delete this line. There is
   still no per-IP rate limit, which only matters once the dashboard is exposed.
-- **Delete's confirm dialog is client-side**, so a browser with JavaScript off submits unasked.
-  The route logs what it removed, place_id included.
 - **Serial checks.** One restaurant at a time, with retry backoff. Fine at the current size;
   the first thing to revisit is `concurrent.futures`, or per-restaurant cadence.
 - **The needs-verifying push repeats every run** while anything is unverified. By design (those
