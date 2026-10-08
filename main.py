@@ -17,69 +17,101 @@ The dashboard is where they get confirmed or thrown out.
 
 Only one run happens at a time: `run_check` takes a lock file, so a manual
 `--once` beside a running scheduler (or two schedulers) skips rather than
-racing on the run counter and double-alerting.
+racing on the run counter and double-alerting. The run counter and the time
+of the last completed run live in the database (`meta` table).
 
 Run once manually:  python main.py --once
 Run on a schedule:   python main.py           (blocks, checks weekly)
 """
 import argparse
 import logging
-import os
+import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from checker import check_one, is_checkable
+import db
+from checker import AlertNotSent, check_one, deliver_pending_alert, is_checkable
 from config import STALE_AFTER_DAYS, configure_logging, env_int
-from db import (DEFAULT_BACKUPS_KEPT, DEFAULT_RETAIN_DAYS, backup_db,
-                get_restaurant, init_db, list_restaurants, prune_check_log)
-from notifier import (notify_needs_verification, notify_run_problems,
-                      notify_scheduler_gap, ping_healthcheck)
-from places_client import PlaceNotFound
+from db import (
+    DEFAULT_BACKUPS_KEPT,
+    DEFAULT_RETAIN_DAYS,
+    backup_db,
+    get_restaurant,
+    init_db,
+    list_pending_alerts,
+    list_restaurants,
+    prune_check_log,
+)
+from notifier import (
+    notify_needs_verification,
+    notify_run_problems,
+    notify_scheduler_gap,
+    ping_healthcheck,
+)
+from places_client import PlaceNotFound, PlacesAuthError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLOSING_SOON_CHECK_EVERY = 4
 
-_run_count_file = os.path.join(os.path.dirname(__file__), "data", ".run_count")
+# Stop a run after this many back-to-back failures that aren't a single bad
+# place_id: the network or Google is down, and grinding through the rest of
+# the list one retry-backoff at a time only delays saying so.
+MAX_CONSECUTIVE_FAILURES = 10
+
+_RUN_COUNT = "run_count"
+_LAST_RUN_AT = "last_run_at"
 
 
-def _closing_soon_check_every():
+def _closing_soon_check_every() -> int:
     """Read at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern."""
     return env_int("CLOSING_SOON_CHECK_EVERY", DEFAULT_CLOSING_SOON_CHECK_EVERY)
 
 
-def _check_log_retain_days():
+def _check_log_retain_days() -> int:
     """Days of per-check detail to keep before folding into monthly rollups;
-    0 disables pruning. Read at call time for the same reason as above."""
+    0 disables pruning."""
     return env_int("CHECK_LOG_RETAIN_DAYS", DEFAULT_RETAIN_DAYS)
 
 
-def _backups_kept():
+def _backups_kept() -> int:
     """How many database backups to keep; 0 disables them."""
     return env_int("BACKUPS_KEPT", DEFAULT_BACKUPS_KEPT)
 
 
-def _read_run_count():
-    """Completed runs so far. A missing, empty or corrupt file reads as 0:
-    losing the count only shifts when the next news check falls due."""
+def _read_run_count() -> int:
+    """Completed runs so far. A missing or corrupt value reads as 0: losing
+    the count only shifts when the next news check falls due. A counter left in
+    the old `data/.run_count` file is picked up once."""
+    raw = db.get_meta(_RUN_COUNT)
+    if raw is None:
+        try:
+            raw = (db.DB_PATH.parent / ".run_count").read_text().strip()
+        except OSError:
+            return 0
     try:
-        with open(_run_count_file) as f:
-            return int(f.read().strip() or 0)
-    except (OSError, ValueError):
+        return int(raw or 0)
+    except ValueError:
         return 0
 
 
-def _write_run_count(count):
-    """Atomic: write a sibling file, then replace, so a crash mid-write can't
-    leave a truncated counter behind."""
-    os.makedirs(os.path.dirname(_run_count_file), exist_ok=True)
-    tmp = _run_count_file + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(str(count))
-    os.replace(tmp, _run_count_file)
+def _write_run_count(count: int) -> None:
+    """Record a finished run: the new count and when it finished."""
+    db.set_meta(_RUN_COUNT, count)
+    db.set_meta(_LAST_RUN_AT, datetime.now(UTC).isoformat())
+
+
+def _last_run_at() -> datetime | None:
+    """When the last run finished (aware, UTC), or None if none has."""
+    raw = db.get_meta(_LAST_RUN_AT)
+    try:
+        return datetime.fromisoformat(raw) if raw else None
+    except ValueError:
+        return None
 
 
 class RunInProgress(Exception):
@@ -87,18 +119,18 @@ class RunInProgress(Exception):
 
 
 @contextmanager
-def _run_lock():
-    """Exclusive, non-blocking OS lock on a file beside the run counter.
+def _run_lock() -> Iterator[None]:
+    """Exclusive, non-blocking OS lock on a file beside the database.
 
     An OS lock rather than a marker file, so a crashed run can't leave a stale
     lock behind: the lock dies with its process.
     """
-    path = _run_count_file + ".lock"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    path = db.DB_PATH.parent / ".run.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
     f = open(path, "a+b")
     try:
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
                 f.seek(0)
                 msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
@@ -106,22 +138,13 @@ def _run_lock():
                 import fcntl
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            raise RunInProgress(path) from e
+            raise RunInProgress(str(path)) from e
         yield
     finally:
         f.close()  # closing releases the lock
 
 
-def _last_run_at():
-    """When the last run finished, or None if none has. The run counter is
-    only rewritten at the end of a completed run, so its mtime is that."""
-    try:
-        return datetime.fromtimestamp(os.path.getmtime(_run_count_file))
-    except OSError:
-        return None
-
-
-def run_check(include_news_check=None):
+def run_check(include_news_check: bool | None = None) -> None:
     """One full pass, unless another is already running -- see `_run_lock`."""
     try:
         with _run_lock():
@@ -130,13 +153,29 @@ def run_check(include_news_check=None):
         logger.warning("Another check run is already in progress -- skipping this one.")
 
 
-def _run_check(include_news_check):
+def _retry_pending_alerts() -> None:
+    """Deliver alerts an earlier run recorded but couldn't send. Archived rows
+    are included: a permanent closure archives the row in the same write that
+    records its alert, so no later check would ever come back for it."""
+    for row in list_pending_alerts():
+        try:
+            deliver_pending_alert(row)
+            logger.info("Delivered the pending %s alert for %s (id=%s)",
+                        row["pending_alert"], row["name"], row["id"])
+        except AlertNotSent:
+            logger.exception("Pending alert for %s (id=%s) still can't be sent",
+                             row["name"], row["id"])
+
+
+def _run_check(include_news_check: bool | None) -> None:
     init_db()
     # Only recorded once the run has finished (see the end of this function),
     # so a run that dies partway doesn't advance the news-check cadence.
     run_count = _read_run_count() + 1
     if include_news_check is None:
         include_news_check = (run_count % _closing_soon_check_every() == 0)
+
+    _retry_pending_alerts()
 
     # Split rather than filtering in SQL: both halves are wanted, and one
     # read keeps the count that gets notified about consistent with the list
@@ -148,9 +187,9 @@ def _run_check(include_news_check):
                 len(restaurants), "on" if include_news_check else "off",
                 f", {len(unverified)} unverified and skipped" if unverified else "")
 
-    failures = news_failures = 0
+    failures = news_failures = consecutive = 0
     gone = []
-    for listed in restaurants:
+    for index, listed in enumerate(restaurants):
         # The list was read before the loop started and a run can take a
         # while: re-read the row, so one deleted, archived or un-verified from
         # the dashboard meanwhile isn't checked (or alerted on) from a stale
@@ -160,16 +199,38 @@ def _run_check(include_news_check):
             logger.info("Skipping %s (id=%s): changed during the run",
                         listed["name"], listed["id"])
             continue
+        remaining = len(restaurants) - index - 1
         try:
             news_failures += check_one(r, include_news_check=include_news_check)["news_failed"]
+            consecutive = 0
         except PlaceNotFound:
             failures += 1
+            consecutive = 0
             gone.append(r)
             logger.error("Google no longer recognises %s (id=%s, place_id=%s) -- "
                          "skipping", r["name"], r["id"], r["place_id"])
+        except AlertNotSent:
+            # The result is recorded; only the send failed, and the next run
+            # delivers it. Not evidence the rest of the list will fail.
+            failures += 1
+            consecutive = 0
+            logger.exception("Alert for %s (id=%s) couldn't be sent -- it will be "
+                             "retried next run", r["name"], r["id"])
+        except PlacesAuthError:
+            # Every remaining request would be refused the same way.
+            failures += 1 + remaining
+            logger.exception("Google rejected the API key checking %s -- aborting "
+                             "the run, %d restaurant(s) unchecked", r["name"], remaining)
+            break
         except Exception:
             failures += 1
+            consecutive += 1
             logger.exception("Check failed for %s (id=%s) -- skipping", r["name"], r["id"])
+            if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                failures += remaining
+                logger.error("%d checks in a row failed -- aborting the run, %d "
+                             "restaurant(s) unchecked", consecutive, remaining)
+                break
 
     if unverified:
         # One push for the whole batch, after the checks so a run with real
@@ -206,7 +267,7 @@ def _run_check(include_news_check):
 
     try:
         _write_run_count(run_count)
-    except OSError:
+    except Exception:
         logger.exception("Couldn't record the run count -- the news-check "
                          "cadence won't advance this run")
 
@@ -224,7 +285,7 @@ def _run_check(include_news_check):
                        "closing-soon flag.", news_failures)
 
 
-def _next_run_time(now):
+def _next_run_time(now: datetime) -> datetime:
     """When the scheduler should first fire: now if a week has passed since the
     last completed run (or there never was one), otherwise when that week is
     up. Firing on every start would run a check -- and advance the news-check
@@ -235,7 +296,7 @@ def _next_run_time(now):
     return last + timedelta(weeks=1)
 
 
-def _warn_if_scheduler_was_down(now):
+def _warn_if_scheduler_was_down(now: datetime) -> None:
     last = _last_run_at()
     if last is None or (now - last).days < STALE_AFTER_DAYS:
         return
@@ -247,8 +308,9 @@ def _warn_if_scheduler_was_down(now):
         logger.exception("Couldn't send the scheduler-gap notification -- continuing")
 
 
-def start_scheduler():
-    now = datetime.now()
+def start_scheduler() -> None:
+    init_db()
+    now = datetime.now(UTC)
     _warn_if_scheduler_was_down(now)
     scheduler = BlockingScheduler()
     # max_instances/coalesce: never overlap runs, and collapse missed ones into

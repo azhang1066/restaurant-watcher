@@ -2,12 +2,12 @@
 repo to regress silently since main.py relies on exact field values
 (business_status, closing_soon_flag, archived) to decide when to notify."""
 import pytest
+from helpers import archive_restaurant
 
 import db
 
 
 def _fresh_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
 
 
@@ -58,7 +58,7 @@ def test_archive_restaurant_excludes_from_active_list(tmp_path, monkeypatch):
     db.add_restaurant("Lilia", "place123")
     restaurant_id = db.list_restaurants()[0]["id"]
 
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     assert db.list_restaurants(active_only=True) == []
     all_restaurants = db.list_restaurants(active_only=False)
@@ -75,7 +75,7 @@ def test_init_db_settles_a_stale_closing_soon_flag_on_a_closed_row(tmp_path, mon
     db.add_restaurant("Lilia", "place123")
     restaurant_id = db.list_restaurants()[0]["id"]
     db.update_check_result(restaurant_id, "CLOSED_PERMANENTLY", True, "Closing after 10 years")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     db.init_db()
 
@@ -251,7 +251,6 @@ def test_restaurants_start_unverified(tmp_path, monkeypatch):
 def test_add_restaurant_can_store_one_already_verified(tmp_path, monkeypatch):
     """What the dashboard's confirm step does -- the user already agreed to
     the match, so there's nothing left to ask."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "place-lilia", verified=True)
 
@@ -302,7 +301,6 @@ def test_migration_verifies_rows_that_were_already_being_checked(tmp_path, monke
     user has been reading alerts about for months. Treating those as
     unverified would silently stop watching all of them, so the column is
     backfilled for anything with a check against it -- and only that."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     with db.get_conn() as conn:
         # Rebuild the pre-migration table: same schema, minus the new column.
@@ -333,7 +331,6 @@ def _version(tmp_path):
 
 
 def test_fresh_database_is_stamped_with_the_latest_version(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
 
     assert _version(tmp_path) == db.SCHEMA_VERSION
@@ -342,7 +339,6 @@ def test_fresh_database_is_stamped_with_the_latest_version(tmp_path, monkeypatch
 def test_constraint_migration_keeps_rows_ids_and_history(tmp_path, monkeypatch):
     """Migration 2 drops and recreates `restaurants`. The ids have to survive
     or every check_log row would describe a different restaurant."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "place-lilia", verified=True)
     rid = db.get_restaurant_by_place_id("place-lilia")["id"]
@@ -359,7 +355,7 @@ def test_constraint_migration_keeps_rows_ids_and_history(tmp_path, monkeypatch):
             business_status TEXT DEFAULT 'OPERATIONAL',
             closing_soon_flag INTEGER DEFAULT 0, closing_soon_summary TEXT,
             last_checked_at TEXT, archived INTEGER DEFAULT 0, verified_at TEXT)""")
-        conn.execute("INSERT INTO restaurants SELECT * FROM restaurants_old")
+        conn.execute("INSERT INTO restaurants (id, name, place_id, address, maps_url, added_at, business_status, closing_soon_flag, closing_soon_summary, last_checked_at, archived, verified_at) SELECT id, name, place_id, address, maps_url, added_at, business_status, closing_soon_flag, closing_soon_summary, last_checked_at, archived, verified_at FROM restaurants_old")
         conn.execute("DROP TABLE restaurants_old")
         conn.execute("PRAGMA user_version = 1")
 
@@ -373,7 +369,6 @@ def test_constraint_migration_keeps_rows_ids_and_history(tmp_path, monkeypatch):
 
 
 def test_init_db_is_idempotent_once_migrated(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "place-lilia")
 
@@ -385,7 +380,6 @@ def test_init_db_is_idempotent_once_migrated(tmp_path, monkeypatch):
 
 def test_a_nonsense_status_is_refused_by_the_database(tmp_path, monkeypatch):
     import sqlite3
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "place-lilia")
     rid = db.get_restaurant_by_place_id("place-lilia")["id"]
@@ -396,7 +390,6 @@ def test_a_nonsense_status_is_refused_by_the_database(tmp_path, monkeypatch):
 
 def test_a_bad_row_aborts_the_constraint_migration_and_loses_nothing(tmp_path, monkeypatch):
     import sqlite3
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     with db.get_conn() as conn:
         conn.execute("DROP TABLE restaurants")
@@ -420,8 +413,8 @@ def test_a_bad_row_aborts_the_constraint_migration_and_loses_nothing(tmp_path, m
 
 def test_foreign_keys_are_enforced(tmp_path, monkeypatch):
     import sqlite3
+
     import pytest
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     with pytest.raises(sqlite3.IntegrityError):
         with db.get_conn() as conn:
@@ -430,7 +423,6 @@ def test_foreign_keys_are_enforced(tmp_path, monkeypatch):
 
 
 def test_connections_use_wal(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     with db.get_conn() as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -438,7 +430,6 @@ def test_connections_use_wal(tmp_path, monkeypatch):
 
 def test_backup_copies_the_database_and_keeps_only_the_newest(tmp_path, monkeypatch):
     import sqlite3
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "p1")
     folder = tmp_path / "backups"
@@ -455,7 +446,6 @@ def test_backup_copies_the_database_and_keeps_only_the_newest(tmp_path, monkeypa
 
 
 def test_archive_flag_is_written_with_the_check_result(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     db.add_restaurant("Lilia", "p1", verified=True)
     rid = db.get_restaurant_by_place_id("p1")["id"]
@@ -464,3 +454,147 @@ def test_archive_flag_is_written_with_the_check_result(tmp_path, monkeypatch):
 
     row = db.get_restaurant(rid)
     assert row["archived"] == 1 and row["business_status"] == "CLOSED_PERMANENTLY"
+
+
+# --- migrations 3 and 4, cascade, small state -----------------------------------
+
+def _make_v2_database():
+    """A database as it was at schema version 2: no pending_alert column, a
+    check_log with a `notes` column, and no ON DELETE CASCADE anywhere."""
+    with db.get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE restaurants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                place_id TEXT UNIQUE NOT NULL, address TEXT, maps_url TEXT,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                business_status TEXT DEFAULT 'OPERATIONAL',
+                closing_soon_flag INTEGER DEFAULT 0, closing_soon_summary TEXT,
+                last_checked_at TEXT, archived INTEGER DEFAULT 0, verified_at TEXT);
+            CREATE TABLE check_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                restaurant_id INTEGER NOT NULL, checked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                business_status TEXT, closing_soon_flag INTEGER, notes TEXT,
+                FOREIGN KEY (restaurant_id) REFERENCES restaurants(id));
+            CREATE TABLE check_log_monthly (
+                restaurant_id INTEGER NOT NULL, month TEXT NOT NULL,
+                checks INTEGER NOT NULL DEFAULT 0,
+                operational_checks INTEGER NOT NULL DEFAULT 0,
+                closed_checks INTEGER NOT NULL DEFAULT 0,
+                closing_soon_checks INTEGER NOT NULL DEFAULT 0,
+                first_checked_at TEXT, last_checked_at TEXT,
+                PRIMARY KEY (restaurant_id, month),
+                FOREIGN KEY (restaurant_id) REFERENCES restaurants(id));
+            INSERT INTO restaurants (name, place_id, verified_at)
+                VALUES ('Lilia', 'place-lilia', '2026-01-01');
+            INSERT INTO check_log (restaurant_id, business_status, closing_soon_flag, notes)
+                VALUES (1, 'OPERATIONAL', 0, 'old');
+            INSERT INTO check_log_monthly (restaurant_id, month, checks)
+                VALUES (1, '2025-12', 4);
+            PRAGMA user_version = 2;
+        """)
+
+
+def test_migrations_3_and_4_keep_history_and_add_cascade(tmp_path):
+    _make_v2_database()
+
+    db.init_db()
+
+    assert _version(tmp_path) == db.SCHEMA_VERSION
+    with db.get_conn() as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(restaurants)")}
+        log_columns = {r["name"] for r in conn.execute("PRAGMA table_info(check_log)")}
+    assert "pending_alert" in columns
+    assert "notes" not in log_columns
+    assert [h["checks"] for h in db.check_history(1)] == [4, 1]
+
+    assert db.delete_restaurant(1)
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM check_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM check_log_monthly").fetchone()[0] == 0
+
+
+def test_two_processes_starting_on_an_old_database_both_succeed(tmp_path):
+    import threading
+    _make_v2_database()
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def start():
+        try:
+            barrier.wait()
+            db.init_db()
+        except Exception as e:  # pragma: no cover -- only on failure
+            errors.append(e)
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert _version(tmp_path) == db.SCHEMA_VERSION
+
+
+def test_deleting_a_restaurant_cascades_to_its_logs():
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia")
+    rid = db.get_restaurant_by_place_id("place-lilia")["id"]
+    db.update_check_result(rid, "OPERATIONAL", False, "")
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO check_log_monthly (restaurant_id, month, checks) "
+                     "VALUES (?, '2025-01', 3)", (rid,))
+
+    db.delete_restaurant(rid)
+
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM check_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM check_log_monthly").fetchone()[0] == 0
+
+
+def test_list_restaurants_is_ordered_by_id():
+    db.init_db()
+    for name in ("Zed", "Alpha", "Mid"):
+        db.add_restaurant(name, f"place-{name}")
+
+    assert [r["name"] for r in db.list_restaurants()] == ["Zed", "Alpha", "Mid"]
+
+
+def test_pending_alert_is_stored_with_the_result_and_listed_even_when_archived():
+    db.init_db()
+    db.add_restaurant("Lilia", "place-lilia", verified=True)
+    rid = db.get_restaurant_by_place_id("place-lilia")["id"]
+
+    db.update_check_result(rid, "CLOSED_PERMANENTLY", False, "", archive=True,
+                           pending_alert="closed")
+
+    assert [r["id"] for r in db.list_pending_alerts()] == [rid]
+    db.clear_pending_alert(rid)
+    assert db.list_pending_alerts() == []
+
+
+def test_meta_round_trips_and_overwrites():
+    db.init_db()
+    assert db.get_meta("k") is None
+    assert db.get_meta("k", "fallback") == "fallback"
+    db.set_meta("k", 1)
+    db.set_meta("k", 2)
+    assert db.get_meta("k") == "2"
+
+
+def test_pending_adds_round_trip_and_expire():
+    db.init_db()
+    db.stash_pending_add("t1", {"place_id": "p", "name": "Lilia"})
+    assert db.get_pending_add("t1") == {"place_id": "p", "name": "Lilia"}
+    assert db.get_pending_add("nope") is None
+    assert db.get_pending_add(None) is None
+
+    with db.get_conn() as conn:
+        conn.execute("UPDATE pending_adds SET created_at = datetime('now', '-2 hours')")
+    assert db.get_pending_add("t1") is None
+    db.stash_pending_add("t2", {"place_id": "q"})  # also sweeps the expired one
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pending_adds").fetchone()[0] == 1
+
+    db.delete_pending_add("t2")
+    assert db.get_pending_add("t2") is None

@@ -15,8 +15,8 @@
 
   {% if restaurant.needs_verification %}
     <div class="card pending">
-      <p style="margin: 0"><b>Is this the right place?</b></p>
-      <p class="muted small" style="margin: .25rem 0 .6rem">
+      <p class="m0"><b>Is this the right place?</b></p>
+      <p class="muted small tight-lg">
         Nothing has been checked here yet, and nothing will be until you say
         this is the restaurant you meant &mdash; a name search returns one
         guess, and the wrong one watches just as happily as the right one.
@@ -36,12 +36,12 @@
   {% endif %}
 
   <ul class="stats">
-    <li style="min-width: 10rem">
+    <li class="minw-10">
       <b class="small">{{ restaurant.checked_age or 'never' }}</b>
       <span>Last checked</span>
     </li>
     {% if restaurant.checked_at %}
-      <li style="min-width: 12rem">
+      <li class="minw-12">
         <b class="small">{{ restaurant.checked_at.strftime('%Y-%m-%d %H:%M') }} UTC</b>
         <span>Timestamp</span>
       </li>
@@ -50,10 +50,10 @@
 
   {% if restaurant.closing_soon_summary %}
     <h2>Closing-soon signal</h2>
-    <div class="card" style="padding: .75rem">
-      <p class="summary-text" style="margin: 0">{{ restaurant.closing_soon_summary }}</p>
+    <div class="card pad-s">
+      <p class="summary-text m0">{{ restaurant.closing_soon_summary }}</p>
       {% if not restaurant.closing_soon %}
-        <p class="muted small" style="margin: .5rem 0 0">
+        <p class="muted small row-note">
           The flag is currently clear &mdash; this is the last summary recorded.
         </p>
       {% endif %}
@@ -89,7 +89,7 @@
       </tbody>
     </table>
   </div>
-  <p class="sub small" style="margin-top: .75rem">
+  <p class="sub small mt-l">
     Counts merge live <code>check_log</code> rows with the monthly rollups
     older checks are folded into, so totals stay right after pruning.
   </p>

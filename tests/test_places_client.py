@@ -61,6 +61,7 @@ class _Resp:
     def __init__(self, status_code, body=None):
         self.status_code = status_code
         self._body = body or {}
+        self.text = ""
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -80,7 +81,40 @@ def test_a_404_for_a_place_id_is_place_not_found(monkeypatch):
 
 def test_other_http_errors_are_not_place_not_found(monkeypatch):
     monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
-    monkeypatch.setattr(places_client._session, "get", lambda *a, **kw: _Resp(403))
+    monkeypatch.setattr(places_client._session, "get", lambda *a, **kw: _Resp(500))
 
     with pytest.raises(RuntimeError):
         places_client.get_business_status("p1")
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_a_refused_key_is_an_auth_error(monkeypatch, code):
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(places_client._session, "get", lambda *a, **kw: _Resp(code))
+    monkeypatch.setattr(places_client._session, "post", lambda *a, **kw: _Resp(code))
+
+    with pytest.raises(places_client.PlacesAuthError):
+        places_client.get_business_status("p1")
+    with pytest.raises(places_client.PlacesAuthError):
+        places_client.find_place_id("Lilia")
+
+
+def test_an_unknown_business_status_is_recorded_as_unspecified(monkeypatch):
+    """The database CHECK would refuse a value it has never heard of, and the
+    row would then fail every run."""
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(places_client._session, "get",
+                        lambda *a, **kw: _Resp(200, {"businessStatus": "ON_FIRE"}))
+
+    assert places_client.get_business_status("p1") == "BUSINESS_STATUS_UNSPECIFIED"
+
+
+def test_the_place_id_is_quoted_into_the_url(monkeypatch):
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    urls = []
+    monkeypatch.setattr(places_client._session, "get",
+                        lambda url, **kw: urls.append(url) or _Resp(200, {}))
+
+    places_client.get_business_status("a/b?c")
+
+    assert urls == [places_client.PLACES_BASE + "/places/a%2Fb%3Fc"]

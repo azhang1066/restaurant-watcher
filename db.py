@@ -1,16 +1,21 @@
 """SQLite storage for tracked restaurants and their check history."""
+import json
 import logging
+import os
 import sqlite3
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from statuses import (ALL_STATUSES, CLOSED_PERMANENTLY, CLOSED_STATUSES,
-                      OPERATIONAL)
+from statuses import ALL_STATUSES, CLOSED_PERMANENTLY, CLOSED_STATUSES, OPERATIONAL
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "data" / "restaurants.db"
+# RESTAURANT_DB_PATH relocates the database (tests, a second profile) without
+# editing code. Read once at import, like the module-level constant it feeds.
+DB_PATH = Path(os.environ.get("RESTAURANT_DB_PATH")
+               or Path(__file__).parent / "data" / "restaurants.db")
 
 _STATUS_LIST = ", ".join(f"'{s}'" for s in ALL_STATUSES)
 _CLOSED_LIST = ", ".join(f"'{s}'" for s in CLOSED_STATUSES)
@@ -30,30 +35,20 @@ _RESTAURANTS_COLUMNS = f"""
     closing_soon_summary TEXT,
     last_checked_at TEXT,
     archived INTEGER DEFAULT 0 CHECK (archived IN (0, 1)),                     -- 1 once we've notified + user has acknowledged
-    verified_at TEXT                               -- when the user confirmed this place_id is the right location; NULL until then
+    verified_at TEXT,                              -- when the user confirmed this place_id is the right location; NULL until then
+    pending_alert TEXT CHECK (pending_alert IN ('closed', 'closing_soon'))  -- an alert recorded with the result but not yet delivered
 """
 
-SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS restaurants ({_RESTAURANTS_COLUMNS});
-
-CREATE TABLE IF NOT EXISTS check_log (
+_CHECK_LOG_COLUMNS = """
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     restaurant_id INTEGER NOT NULL,
     checked_at TEXT DEFAULT CURRENT_TIMESTAMP,
     business_status TEXT,
     closing_soon_flag INTEGER,
-    notes TEXT,
-    FOREIGN KEY (restaurant_id) REFERENCES restaurants(id)
-);
+    FOREIGN KEY (restaurant_id) REFERENCES restaurants(id) ON DELETE CASCADE
+"""
 
-CREATE INDEX IF NOT EXISTS idx_check_log_restaurant_time
-    ON check_log (restaurant_id, checked_at);
-
--- Rolled-up history. When detail rows in check_log age out (see
--- prune_check_log) their counts are folded in here, so how often a
--- restaurant was checked -- and what was seen -- survives without keeping
--- one row per check forever.
-CREATE TABLE IF NOT EXISTS check_log_monthly (
+_MONTHLY_COLUMNS = """
     restaurant_id INTEGER NOT NULL,
     month TEXT NOT NULL,                           -- 'YYYY-MM'
     checks INTEGER NOT NULL DEFAULT 0,
@@ -63,15 +58,45 @@ CREATE TABLE IF NOT EXISTS check_log_monthly (
     first_checked_at TEXT,
     last_checked_at TEXT,
     PRIMARY KEY (restaurant_id, month),
-    FOREIGN KEY (restaurant_id) REFERENCES restaurants(id)
+    FOREIGN KEY (restaurant_id) REFERENCES restaurants(id) ON DELETE CASCADE
+"""
+
+SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS restaurants ({_RESTAURANTS_COLUMNS});
+
+CREATE TABLE IF NOT EXISTS check_log ({_CHECK_LOG_COLUMNS});
+
+-- Rolled-up history. When detail rows in check_log age out (see
+-- prune_check_log) their counts are folded in here, so how often a
+-- restaurant was checked -- and what was seen -- survives without keeping
+-- one row per check forever.
+CREATE TABLE IF NOT EXISTS check_log_monthly ({_MONTHLY_COLUMNS});
+
+-- Small key/value state that belongs with the data (run counter, last run).
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- A search result waiting for the user's yes on the confirm page. Held here,
+-- not in the session cookie, which has 4KB and drops silently past it.
+CREATE TABLE IF NOT EXISTS pending_adds (
+    token TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
 
-# Created after migrations rather than in SCHEMA: migration 2 drops and
-# recreates the restaurants table, which takes its indexes with it.
+# Created after migrations rather than in SCHEMA: migrations 2 and 4 drop and
+# recreate tables, which takes their indexes with it.
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
+CREATE INDEX IF NOT EXISTS idx_check_log_restaurant_time
+    ON check_log (restaurant_id, checked_at);
 """
+
+# A search result is only worth confirming for so long.
+PENDING_ADD_TTL_HOURS = 1
 
 DEFAULT_RETAIN_DAYS = 90
 DEFAULT_BACKUPS_KEPT = 8
@@ -83,7 +108,7 @@ BUSY_TIMEOUT_SECONDS = 30
 
 
 @contextmanager
-def get_conn():
+def get_conn() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
@@ -93,6 +118,9 @@ def get_conn():
     # Off by default and per-connection: without it the REFERENCES clauses in
     # SCHEMA are documentation, not constraints.
     conn.execute("PRAGMA foreign_keys = ON")
+    # In WAL mode NORMAL can lose the last commit on power failure but never
+    # corrupts, and skips an fsync per commit.
+    conn.execute("PRAGMA synchronous = NORMAL")
     try:
         yield conn
         conn.commit()
@@ -100,7 +128,7 @@ def get_conn():
         conn.close()
 
 
-def _migrate_1_add_verified_at(conn):
+def _migrate_1_add_verified_at(conn: sqlite3.Connection) -> None:
     """Add `verified_at` to a table that predates it, backfilling anything
     already being watched.
 
@@ -116,7 +144,7 @@ def _migrate_1_add_verified_at(conn):
                     WHERE verified_at IS NULL AND last_checked_at IS NOT NULL""")
 
 
-def _migrate_2_add_constraints(conn):
+def _migrate_2_add_constraints(conn: sqlite3.Connection) -> None:
     """Rebuild `restaurants` so status and flag columns carry CHECK constraints.
 
     SQLite can't add a CHECK to an existing table, so this is the documented
@@ -133,14 +161,43 @@ def _migrate_2_add_constraints(conn):
     conn.execute("ALTER TABLE restaurants_new RENAME TO restaurants")
 
 
+def _migrate_3_add_pending_alert(conn: sqlite3.Connection) -> None:
+    """Add `pending_alert`: the result is now written before its alert is sent,
+    and this records an alert that still has to go out."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")}
+    if "pending_alert" not in columns:
+        conn.execute("ALTER TABLE restaurants ADD COLUMN pending_alert TEXT "
+                     "CHECK (pending_alert IN ('closed', 'closing_soon'))")
+
+
+def _migrate_4_cascade_logs(conn: sqlite3.Connection) -> None:
+    """Rebuild the log tables with ON DELETE CASCADE, and without the
+    never-used `check_log.notes` column. Row ids are kept."""
+    conn.execute(f"CREATE TABLE check_log_new ({_CHECK_LOG_COLUMNS})")
+    conn.execute("""INSERT INTO check_log_new
+                        (id, restaurant_id, checked_at, business_status, closing_soon_flag)
+                    SELECT id, restaurant_id, checked_at, business_status, closing_soon_flag
+                    FROM check_log""")
+    conn.execute("DROP TABLE check_log")
+    conn.execute("ALTER TABLE check_log_new RENAME TO check_log")
+
+    conn.execute(f"CREATE TABLE check_log_monthly_new ({_MONTHLY_COLUMNS})")
+    conn.execute("INSERT INTO check_log_monthly_new SELECT restaurant_id, month, checks, "
+                 "operational_checks, closed_checks, closing_soon_checks, "
+                 "first_checked_at, last_checked_at FROM check_log_monthly")
+    conn.execute("DROP TABLE check_log_monthly")
+    conn.execute("ALTER TABLE check_log_monthly_new RENAME TO check_log_monthly")
+
+
 # Schema version N lives in `PRAGMA user_version`; _MIGRATIONS[N-1] takes a
 # database from version N-1 to N. Append to the list to add one -- each runs
 # once, in order, inside a transaction.
-_MIGRATIONS = [_migrate_1_add_verified_at, _migrate_2_add_constraints]
+_MIGRATIONS = [_migrate_1_add_verified_at, _migrate_2_add_constraints,
+               _migrate_3_add_pending_alert, _migrate_4_cascade_logs]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 
-def _migrate(conn):
+def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing database up to SCHEMA_VERSION."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version >= SCHEMA_VERSION:
@@ -152,8 +209,15 @@ def _migrate(conn):
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         for number in range(version + 1, SCHEMA_VERSION + 1):
-            conn.execute("BEGIN")
+            # IMMEDIATE takes the write lock up front, and the version is
+            # re-read under it: the dashboard and the scheduler can both start
+            # against an old file, and the loser must find the work done
+            # rather than run it twice.
+            conn.execute("BEGIN IMMEDIATE")
             try:
+                if conn.execute("PRAGMA user_version").fetchone()[0] >= number:
+                    conn.execute("ROLLBACK")
+                    continue
                 _MIGRATIONS[number - 1](conn)
                 # PRAGMA doesn't take parameters; `number` is an int we control.
                 conn.execute(f"PRAGMA user_version = {number}")
@@ -173,7 +237,7 @@ def _migrate(conn):
         conn.execute("PRAGMA foreign_keys = ON")
 
 
-def init_db():
+def init_db() -> None:
     with get_conn() as conn:
         fresh = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'restaurants'"
@@ -197,7 +261,8 @@ def init_db():
         )
 
 
-def add_restaurant(name, place_id, address=None, maps_url=None, verified=False):
+def add_restaurant(name: str, place_id: str, address: str | None = None,
+                   maps_url: str | None = None, verified: bool = False) -> None:
     """Insert a restaurant, ignoring the insert if its place_id is already known.
 
     `verified` records that the caller already showed the user which place
@@ -214,15 +279,16 @@ def add_restaurant(name, place_id, address=None, maps_url=None, verified=False):
         )
 
 
-def list_restaurants(active_only=True):
+def list_restaurants(active_only: bool = True) -> list[dict]:
     with get_conn() as conn:
         q = "SELECT * FROM restaurants"
         if active_only:
             q += " WHERE archived = 0"
+        q += " ORDER BY id"
         return [dict(r) for r in conn.execute(q).fetchall()]
 
 
-def get_restaurant(restaurant_id):
+def get_restaurant(restaurant_id: int) -> dict | None:
     """One restaurant by id, or None if there's no such row. Same dict shape
     as list_restaurants(), archived or not -- the dashboard links to archived
     rows too, and they're exactly the ones list_restaurants() hides."""
@@ -233,7 +299,7 @@ def get_restaurant(restaurant_id):
     return dict(row) if row else None
 
 
-def get_restaurant_by_place_id(place_id):
+def get_restaurant_by_place_id(place_id: str) -> dict | None:
     """One restaurant by its Google place_id, or None. Same dict shape as
     get_restaurant(), archived rows included.
 
@@ -248,9 +314,15 @@ def get_restaurant_by_place_id(place_id):
     return dict(row) if row else None
 
 
-def update_check_result(restaurant_id, business_status, closing_soon_flag,
-                        closing_soon_summary, archive=False):
+def update_check_result(restaurant_id: int, business_status: str,
+                        closing_soon_flag: bool, closing_soon_summary: str,
+                        archive: bool = False,
+                        pending_alert: str | None = None) -> bool:
     """Record one check: the row's new state plus its check_log entry.
+
+    `pending_alert` ('closed' / 'closing_soon' / None) is stored in the same
+    transaction, so the transition and the fact that it still has to be
+    announced land together; see clear_pending_alert().
 
     `archive` flips the archived flag in the same transaction, so a crash
     can't leave a permanently closed row recorded but still on the active list.
@@ -262,9 +334,10 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag,
         updated = conn.execute(
             """UPDATE restaurants
                SET business_status = ?, closing_soon_flag = ?, closing_soon_summary = ?,
-                   last_checked_at = CURRENT_TIMESTAMP
+                   last_checked_at = CURRENT_TIMESTAMP, pending_alert = ?
                WHERE id = ?""",
-            (business_status, int(closing_soon_flag), closing_soon_summary, restaurant_id),
+            (business_status, int(closing_soon_flag), closing_soon_summary,
+             pending_alert, restaurant_id),
         ).rowcount
         if not updated:
             return False
@@ -278,12 +351,23 @@ def update_check_result(restaurant_id, business_status, closing_soon_flag,
     return True
 
 
-def archive_restaurant(restaurant_id):
+def clear_pending_alert(restaurant_id: int) -> None:
+    """The alert recorded by update_check_result() has been delivered."""
     with get_conn() as conn:
-        conn.execute("UPDATE restaurants SET archived = 1 WHERE id = ?", (restaurant_id,))
+        conn.execute("UPDATE restaurants SET pending_alert = NULL WHERE id = ?",
+                     (restaurant_id,))
 
 
-def unarchive_restaurant(restaurant_id):
+def list_pending_alerts() -> list[dict]:
+    """Rows with an undelivered alert, archived ones included -- a permanent
+    closure archives the row in the same write that records its alert."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM restaurants WHERE pending_alert IS NOT NULL "
+                            "ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def unarchive_restaurant(restaurant_id: int) -> bool:
     """Put an archived restaurant back on the active list. Returns True if a
     row changed, False if there's no such restaurant.
 
@@ -306,7 +390,7 @@ def unarchive_restaurant(restaurant_id):
     return changed > 0
 
 
-def verify_restaurants(restaurant_ids):
+def verify_restaurants(restaurant_ids: Iterable[int]) -> int:
     """Record that the user confirmed these rows point at the right place, in
     one transaction. Returns how many were newly verified.
 
@@ -325,15 +409,16 @@ def verify_restaurants(restaurant_ids):
         ).rowcount
 
 
-def verify_restaurant(restaurant_id):
+def verify_restaurant(restaurant_id: int) -> bool:
     """verify_restaurants() for one row: True if it was newly verified, False
     if it was already verified or doesn't exist."""
     return verify_restaurants([restaurant_id]) > 0
 
 
-def delete_restaurant(restaurant_id):
-    """Remove a restaurant and everything logged about it. Returns True if a
-    row went, False if there was no such restaurant.
+def delete_restaurant(restaurant_id: int) -> bool:
+    """Remove a restaurant and everything logged about it (the log tables
+    cascade). Returns True if a row went, False if there was no such
+    restaurant.
 
     This is for a row that was never the right place to begin with, which is
     why it deletes rather than archives: its check history describes some
@@ -341,15 +426,13 @@ def delete_restaurant(restaurant_id):
     forever. Archiving is the tool for a place that really did close.
     """
     with get_conn() as conn:
-        conn.execute("DELETE FROM check_log WHERE restaurant_id = ?", (restaurant_id,))
-        conn.execute("DELETE FROM check_log_monthly WHERE restaurant_id = ?", (restaurant_id,))
         removed = conn.execute(
             "DELETE FROM restaurants WHERE id = ?", (restaurant_id,)
         ).rowcount
     return removed > 0
 
 
-def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
+def prune_check_log(retain_days: int = DEFAULT_RETAIN_DAYS) -> int:
     """Fold aged-out check_log rows into check_log_monthly, then delete them.
 
     check_log gains a row per restaurant per run, so left alone it grows
@@ -424,7 +507,7 @@ def prune_check_log(retain_days=DEFAULT_RETAIN_DAYS):
     return removed
 
 
-def check_history(restaurant_id):
+def check_history(restaurant_id: int) -> list[dict]:
     """Per-month check history for one restaurant: rolled-up counts plus the
     detail rows still in check_log, merged into one row per month."""
     with get_conn() as conn:
@@ -462,19 +545,18 @@ def check_history(restaurant_id):
     return [dict(r) for r in rows]
 
 
-def backup_db(keep=DEFAULT_BACKUPS_KEPT):
+def backup_db(keep: int = DEFAULT_BACKUPS_KEPT) -> Path:
     """Copy the database to a timestamped file in `backups/` beside it, then
     delete all but the newest `keep`. Returns the new file's path.
 
     The dashboard's verify queue is hand-done work with no other copy, and
     `data/` is gitignored. Uses SQLite's online backup API, which is safe
     while the dashboard has the file open (a plain file copy isn't in WAL
-    mode).
+    mode). The database must already exist -- callers have run init_db().
     """
-    init_db()
     folder = DB_PATH.parent / "backups"
     folder.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     target = folder / f"{DB_PATH.stem}-{stamp}.db"
     with get_conn() as source:
         dest = sqlite3.connect(target)
@@ -487,3 +569,47 @@ def backup_db(keep=DEFAULT_BACKUPS_KEPT):
     for path in old:
         path.unlink()
     return target
+
+
+# --- small state ---------------------------------------------------------------
+
+def get_meta(key: str, default: str | None = None) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_meta(key: str, value) -> None:
+    with get_conn() as conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                     "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                     (key, str(value)))
+
+
+def stash_pending_add(token: str, candidate: dict) -> None:
+    """Hold a search result for the confirm page, and drop any that have sat
+    past PENDING_ADD_TTL_HOURS."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pending_adds WHERE created_at < datetime('now', ?)",
+                     (f"-{PENDING_ADD_TTL_HOURS} hours",))
+        conn.execute("INSERT OR REPLACE INTO pending_adds (token, payload) VALUES (?, ?)",
+                     (token, json.dumps(candidate)))
+
+
+def get_pending_add(token: str | None) -> dict | None:
+    """The stashed candidate for `token`, or None if unknown or expired."""
+    if not token:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM pending_adds WHERE token = ? "
+            "AND created_at >= datetime('now', ?)",
+            (token, f"-{PENDING_ADD_TTL_HOURS} hours")).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def delete_pending_add(token: str | None) -> None:
+    if not token:
+        return
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pending_adds WHERE token = ?", (token,))

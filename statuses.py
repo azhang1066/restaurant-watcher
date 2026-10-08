@@ -13,3 +13,15 @@ UNSPECIFIED = "BUSINESS_STATUS_UNSPECIFIED"
 
 CLOSED_STATUSES = (CLOSED_PERMANENTLY, CLOSED_TEMPORARILY)
 ALL_STATUSES = (OPERATIONAL, CLOSED_TEMPORARILY, CLOSED_PERMANENTLY, UNSPECIFIED)
+
+# How each status reads: LABELS on the dashboard, PHRASES in the sentence
+# "<name> is <phrase>" of an alert.
+LABELS = {
+    OPERATIONAL: "Open",
+    CLOSED_TEMPORARILY: "Closed temporarily",
+    CLOSED_PERMANENTLY: "Closed permanently",
+}
+PHRASES = {
+    CLOSED_TEMPORARILY: "temporarily closed",
+    CLOSED_PERMANENTLY: "permanently closed",
+}

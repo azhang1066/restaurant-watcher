@@ -20,22 +20,21 @@ Where restaurants.txt has one restaurant per line, e.g.:
 import logging
 import sys
 
-import config
-from db import (add_restaurant, get_restaurant_by_place_id, init_db,
-                list_restaurants)
+import config  # noqa: F401 -- importing it is what loads .env
+from db import add_restaurant, get_restaurant_by_place_id, init_db, list_restaurants
 from places_client import find_place_id, place_summary
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_line(line):
+def _parse_line(line: str) -> tuple[str, str]:
     if "," in line:
         name, hint = line.split(",", 1)
         return name.strip(), hint.strip()
     return line, ""
 
 
-def seed_from_file(path):
+def seed_from_file(path: str) -> dict:
     """Resolve each line and add it. Returns a dict of counts: added,
     existing, no_match, failed.
 

@@ -9,10 +9,10 @@ whatever the anthropic SDK defaulted to, which was quietly out of step with
 the urllib3 Retry adapters in places_client/notifier -- the point of the
 tests below is that changing it has to be deliberate.
 """
-import pytest
 from types import SimpleNamespace
 
 import anthropic
+import pytest
 
 import closure_checker
 

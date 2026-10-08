@@ -14,21 +14,27 @@ place's status on a schedule rather than syncing the list itself.
 ## Setup
 
 ```bash
-pip install -r requirements.txt        # runtime
-# pip install -r requirements-dev.txt   # adds pytest, to run the tests
+pip install -c requirements-lock.txt -r requirements.txt   # runtime
+# pip install -c requirements-lock.txt -r requirements-dev.txt   # + pytest, ruff, mypy
 cp .env.example .env   # fill in your keys
 ```
 
-Dependencies are pinned exactly. `.github/dependabot.yml` opens a weekly PR for
-any bump; run the tests before merging one. The Claude model for the news check
+Python 3.13 (`.python-version`). Dependencies are pinned exactly, and
+`requirements-lock.txt` pins the transitive ones too. `.github/dependabot.yml`
+opens a weekly PR for any bump, and CI (`.github/workflows/tests.yml`) runs
+`ruff check .`, `mypy` and `pytest` on it -- run the same three locally before
+merging anything. The Claude model for the news check
 is a default in `closure_checker.py` that `CLOSURE_CHECK_MODEL` overrides, so
 when a model is retired you can switch it from `.env` without a code change.
 
 You'll need:
 - **Google Places API key** (Places API "New" enabled in Google Cloud Console)
 - **Anthropic API key** (for the closing-soon news check)
-- **ntfy topic** -- pick any unique string, then subscribe to it in the
-  [ntfy app](https://ntfy.sh/) on your phone
+- **ntfy topic** (`NTFY_TOPIC`) -- pick a long, unguessable string, then subscribe
+  to it in the [ntfy app](https://ntfy.sh/) on your phone. Topics are public: anyone
+  who knows the name can read the feed. So **no push is sent** while it's unset or
+  still the placeholder from `.env.example` (an error is logged instead, and email
+  still goes out if you've configured it).
 - **SMTP credentials** (optional) -- set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`,
   `EMAIL_FROM`, and `EMAIL_TO` in `.env` to also get alerts by email. Leave these
   unset and only ntfy push notifications will fire. For Gmail, use an
@@ -65,6 +71,29 @@ For a real deployment, run `main.py` as a background service (systemd,
 Replit scheduled deployment, or a cron entry calling `--once`) rather than
 leaving a terminal open.
 
+Only one run happens at a time: a second `--once` while the scheduler is
+mid-run is skipped with a warning, not run alongside it. Restarting the
+scheduler doesn't trigger a check; its first run is a week after the last
+completed one (or immediately, if that was longer ago or there never was one).
+The run counter and the time of the last completed run live in the database.
+
+Logs go to stderr and to `data/restaurant-watcher.log` (rotating; `LOG_FILE`
+moves it, `LOG_FILE=off` disables it).
+
+### Noticing a dead scheduler
+
+A scheduler that has stopped can't tell you so itself. Two things cover it:
+
+- Set `HEALTHCHECK_URL` to a push monitor ([healthchecks.io](https://healthchecks.io),
+  Uptime Kuma, ...). Each completed run pings it (`/fail` if every check failed), and
+  the monitor alerts you when the pings stop. This is the one that catches the
+  scheduler while it is down.
+- When the scheduler starts after 14+ days without a completed run, it sends a
+  high-priority push saying so. That only fires once it's back, so it covers
+  "I restarted it and want to know what I missed", not "it died".
+
+The dashboard also flags anything not checked in 14+ days as **Stale**.
+
 ## Dashboard
 
 A local page over whatever the checks have recorded:
@@ -75,7 +104,9 @@ python app.py           # http://127.0.0.1:5000
 
 The index lists every tracked restaurant -- closures and closing-soon
 signals sorted to the top -- with its status, last-checked age, and the
-summary behind any closing-soon flag. Clicking one opens its per-month
+summary behind any closing-soon flag. It's paged (100 a page) and has a filter
+box matching name or address; the tiles at the top always count everything.
+The "waiting to be verified" card spells out the first 50. Clicking one opens its per-month
 check history (`db.check_history()`, which merges live `check_log` rows with
 the rollups older checks are folded into, so the totals survive pruning).
 Archived restaurants stay listed, greyed out, rather than disappearing.
@@ -187,10 +218,12 @@ left as they were, so re-activating can't re-fire a closure alert that already
 went out. That does mean a place Google still reports as permanently closed
 gets archived again by the next check; the page says so when you click it.
 
-Forms carry a CSRF token tied to the session cookie, so set
+Every POST is CSRF-checked by one hook (a route added later is covered by
+default), against a token tied to the session cookie, so set
 `DASHBOARD_SECRET_KEY` in `.env` if you want tokens to survive a restart.
 Without it a key is generated per process and an open page just needs a
-reload after the server restarts.
+reload after the server restarts. Pages load no inline script or style, and
+send a Content-Security-Policy saying so.
 
 It binds to localhost and has no auth or login, so don't expose it to a
 network -- more so now that buttons on it add rows and spend API calls.
@@ -216,6 +249,15 @@ Permanent closures auto-archive the restaurant after notifying; temporary
 closures and closing-soon flags stay active so you keep getting the
 context on future runs.
 
+A check's result and the alert it owes are recorded together; the alert is
+then sent and marked delivered. If ntfy and email are both down, the new status
+is still saved and the alert goes out first thing on the next run (archived
+rows included), once -- it is neither lost nor repeated.
+
+A news-check reply that is cut off, not JSON, or otherwise unreadable counts as
+a *failed* news check, not as "no closure news": the stored flag is kept and
+the log says why.
+
 ## History retention
 
 Every check appends a row to `check_log`, so after each run rows older than
@@ -240,6 +282,12 @@ A run that couldn't check some restaurants sends one push saying how many,
 and names any that Google answers 404 for (a retired place id). Those keep
 failing every run until you delete the row and add the place again from the
 dashboard.
+
+A run stops early, counting the rest as failed, when Google refuses the API key
+(401/403) or 10 checks in a row fail for any other reason -- there's no point
+grinding through the list one retry at a time when the key or the network is
+down. A `businessStatus` value Google adds in future is stored as
+`BUSINESS_STATUS_UNSPECIFIED` and logged, rather than failing that row forever.
 
 ## Cost notes
 

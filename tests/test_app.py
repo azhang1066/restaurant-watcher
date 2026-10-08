@@ -19,19 +19,19 @@ Same setup as the other tests: a real temp SQLite file via db.DB_PATH, so
 the rows these pages render are written and read exactly as in production.
 """
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from helpers import archive_restaurant
 
 import app as dashboard
-import db
 import checker
+import db
 import main
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setenv("DASHBOARD_SECRET_KEY", "test-key")
     db.init_db()
     return dashboard.create_app().test_client()
@@ -162,7 +162,7 @@ def test_index_includes_archived_restaurants(client):
     dropping off the page entirely is indistinguishable from never having
     been tracked."""
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     body = _text(client.get("/"))
     assert "Lilia" in body
@@ -180,7 +180,7 @@ def test_index_sorts_concerns_above_healthy_rows(client):
 def test_summary_counts_exclude_archived_from_tracked(client):
     _add("Lilia", "place-lilia")
     archived = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(archived)
+    archive_restaurant(archived)
 
     body = _text(client.get("/"))
     # One tracked (Lilia), one archived -- the archived row must not inflate
@@ -194,7 +194,7 @@ def test_detail_shows_history_rollups(client):
 
     body = _text(client.get(f"/restaurant/{restaurant_id}"))
     assert "Closing in June" in body
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    month = datetime.now(UTC).strftime("%Y-%m")
     assert month in body
 
 
@@ -204,7 +204,7 @@ def test_detail_404s_for_unknown_restaurant(client):
 
 def test_detail_reachable_for_archived_restaurant(client):
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     assert client.get(f"/restaurant/{restaurant_id}").status_code == 200
 
@@ -221,7 +221,7 @@ def test_never_checked_restaurant_is_not_stale(client):
 
 def test_old_last_check_is_flagged_stale(client):
     restaurant_id = _add("Lilia", "place-lilia")
-    stale_at = datetime.now(timezone.utc) - timedelta(days=dashboard.STALE_AFTER_DAYS + 1)
+    stale_at = datetime.now(UTC) - timedelta(days=dashboard.STALE_AFTER_DAYS + 1)
     with db.get_conn() as conn:
         conn.execute("UPDATE restaurants SET last_checked_at = ? WHERE id = ?",
                      (stale_at.strftime("%Y-%m-%d %H:%M:%S"), restaurant_id))
@@ -235,7 +235,6 @@ def test_timestamps_are_read_as_utc_not_local(tmp_path, monkeypatch):
     """db writes CURRENT_TIMESTAMP, which is UTC. Parsing it as local time
     would skew every age on the page by the viewer's offset -- and on
     UTC-behind machines would put the last check in the future."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     db.init_db()
     restaurant_id = _add("Lilia", "place-lilia", status="OPERATIONAL")
 
@@ -243,7 +242,7 @@ def test_timestamps_are_read_as_utc_not_local(tmp_path, monkeypatch):
     parsed = dashboard._parse_ts(restaurant["last_checked_at"])
     assert parsed.tzinfo is not None
     # Just written, so its age is seconds -- not the hours a bad tz read gives.
-    assert abs((datetime.now(timezone.utc) - parsed).total_seconds()) < 60
+    assert abs((datetime.now(UTC) - parsed).total_seconds()) < 60
 
 
 def test_parse_ts_tolerates_missing_and_malformed_values():
@@ -253,7 +252,7 @@ def test_parse_ts_tolerates_missing_and_malformed_values():
 
 
 def test_age_labels_read_naturally():
-    now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
     assert dashboard._age(now - timedelta(days=1), now) == "1 day ago"
     assert dashboard._age(now - timedelta(days=3), now) == "3 days ago"
     assert dashboard._age(now - timedelta(hours=5), now) == "5 hours ago"
@@ -265,7 +264,7 @@ def test_age_labels_read_naturally():
 
 def test_unarchive_puts_restaurant_back_on_active_list(client):
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_TEMPORARILY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
     assert db.list_restaurants(active_only=True) == []
 
     response = _post_unarchive(client, restaurant_id)
@@ -281,7 +280,7 @@ def test_unarchive_leaves_status_and_flag_untouched(client):
     restaurant_id = _add("Lilia", "place-lilia",
                          status="CLOSED_PERMANENTLY", closing_soon=True,
                          summary="Final service in March")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     _post_unarchive(client, restaurant_id)
 
@@ -297,7 +296,7 @@ def test_unarchive_warns_when_google_still_says_closed(client):
     again on the next run -- the page has to say so rather than implying the
     re-activation stuck."""
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     body = _text(_post_unarchive(client, restaurant_id, follow_redirects=True))
     assert "will archive it again" in body
@@ -305,7 +304,7 @@ def test_unarchive_warns_when_google_still_says_closed(client):
 
 def test_unarchive_of_temporary_closure_has_no_warning(client):
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_TEMPORARILY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     body = _text(_post_unarchive(client, restaurant_id, follow_redirects=True))
     assert "back on the active list" in body
@@ -323,7 +322,7 @@ def test_unarchive_is_idempotent_on_an_active_restaurant(client):
 
 def test_unarchive_rejects_missing_csrf_token(client):
     restaurant_id = _add("Lilia", "place-lilia")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     response = client.post(f"/restaurant/{restaurant_id}/unarchive", data={})
 
@@ -333,7 +332,7 @@ def test_unarchive_rejects_missing_csrf_token(client):
 
 def test_unarchive_rejects_wrong_csrf_token(client):
     restaurant_id = _add("Lilia", "place-lilia")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     response = _post_unarchive(client, restaurant_id, token="not-the-token")
 
@@ -345,7 +344,7 @@ def test_unarchive_rejects_get(client):
     """A state change behind a GET is one crawler or prefetch away from
     firing on its own."""
     restaurant_id = _add("Lilia", "place-lilia")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     assert client.get(f"/restaurant/{restaurant_id}/unarchive").status_code == 405
     assert db.get_restaurant(restaurant_id)["archived"] == 1
@@ -357,12 +356,12 @@ def test_unarchive_404s_for_unknown_restaurant(client):
 
 def test_unarchive_returns_to_the_page_it_came_from(client):
     restaurant_id = _add("Lilia", "place-lilia")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     from_index = _post_unarchive(client, restaurant_id, return_to="index")
     assert from_index.headers["Location"] == "/"
 
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
     from_detail = _post_unarchive(client, restaurant_id, return_to="detail")
     assert from_detail.headers["Location"] == f"/restaurant/{restaurant_id}"
 
@@ -371,7 +370,7 @@ def test_return_to_cannot_redirect_off_site(client):
     """`return_to` picks between two endpoint names; anything else falls back
     to the detail page, so it cannot be used as an open redirect."""
     restaurant_id = _add("Lilia", "place-lilia")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     response = _post_unarchive(client, restaurant_id,
                                return_to="https://evil.example.com/")
@@ -382,7 +381,7 @@ def test_return_to_cannot_redirect_off_site(client):
 def test_reactivate_button_shown_only_for_archived_rows(client):
     active_id = _add("Lilia", "place-lilia")
     archived_id = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(archived_id)
+    archive_restaurant(archived_id)
 
     body = _text(client.get("/"))
     assert f"/restaurant/{archived_id}/unarchive" in body
@@ -391,7 +390,7 @@ def test_reactivate_button_shown_only_for_archived_rows(client):
 
 def test_detail_page_offers_reactivation_when_archived(client):
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     body = _text(client.get(f"/restaurant/{restaurant_id}"))
     assert "Re-activate" in body
@@ -403,7 +402,7 @@ def test_unarchive_accepts_a_token_from_a_rendered_page(client):
     the one the view accepts. The other tests seed the session directly, so
     this is what would catch the form and the check drifting apart."""
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_TEMPORARILY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
 
     page = _text(client.get("/"))
     token = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
@@ -449,7 +448,7 @@ def test_confirm_tracks_the_restaurant(client, monkeypatch):
     assert rows[0]["maps_url"] == "https://maps.example/lilia"
     assert rows[0]["business_status"] == "OPERATIONAL"
     assert rows[0]["last_checked_at"] is None  # nothing has checked it yet
-    assert response.headers["Location"].endswith("/restaurant/%d" % rows[0]["id"])
+    assert response.headers["Location"].endswith(f"/restaurant/{rows[0]['id']}")
 
 
 def test_confirm_stores_googles_name_not_the_typed_one(client, monkeypatch):
@@ -515,8 +514,8 @@ def test_add_search_of_a_tracked_place_goes_to_the_existing_row(client, monkeypa
 
     response = _post_add(client, name="Lilia")
 
-    assert response.headers["Location"].endswith("/restaurant/%d" % existing_id)
-    assert "Already tracking Lilia" in _text(client.get("/restaurant/%d" % existing_id))
+    assert response.headers["Location"].endswith(f"/restaurant/{existing_id}")
+    assert "Already tracking Lilia" in _text(client.get(f"/restaurant/{existing_id}"))
     assert len(_tracked()) == 1
 
 
@@ -524,7 +523,7 @@ def test_add_search_of_an_archived_place_says_it_is_archived(client, monkeypatch
     """Searching for something you'd given up on is how you would rediscover
     that it reopened -- and the row it lands on has the Re-activate button."""
     existing_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(existing_id)
+    archive_restaurant(existing_id)
     _patch_search(monkeypatch)
 
     body = _text(_post_add(client, name="Lilia", follow_redirects=True))
@@ -898,10 +897,11 @@ def test_dashboard_adds_are_stored_already_verified(client):
     would be the same question about the same two facts -- and would leave a
     just-added restaurant unchecked until it was answered twice."""
     token = _csrf(client)
+    db.stash_pending_add("tok", {"name": "Lilia", "place_id": "place-lilia",
+                                 "address": "567 Union Ave", "maps_url": "",
+                                 "query": "lilia"})
     with client.session_transaction() as sess:
-        sess["pending_add"] = {"name": "Lilia", "place_id": "place-lilia",
-                               "address": "567 Union Ave", "maps_url": "",
-                               "query": "lilia"}
+        sess["pending_add"] = "tok"
 
     client.post("/add/confirm", data={"csrf_token": token, "place_id": "place-lilia"})
 
@@ -945,7 +945,7 @@ def test_every_row_offers_a_delete_button(client):
     rows -- and they're the likeliest thing anyone wants gone."""
     active_id = _add("Lilia", "place-lilia")
     archived_id = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(archived_id)
+    archive_restaurant(archived_id)
 
     body = client.get("/").get_data(as_text=True)
 
@@ -959,24 +959,23 @@ def test_delete_button_asks_for_confirmation(client):
 
     body = client.get("/").get_data(as_text=True)
 
-    assert "return confirm(" in body
-    assert "cannot be undone" in body
+    assert "data-confirm-delete=" in body
+    js = client.get("/static/app.js").get_data(as_text=True)
+    assert "confirm(" in js
+    assert "cannot be undone" in js
 
 
 def test_delete_confirmation_survives_an_apostrophe_in_the_name(client):
-    """A name goes into a JavaScript string, and autoescaping alone would put
-    a bare quote there (&#39; is a quote by the time JS sees it) -- ending the
-    string early and taking the confirm() with it, so the button would delete
-    without asking. |tojson is what keeps that from happening."""
+    """The name rides in a data attribute that app.js reads back as text, so
+    there is no JavaScript string for a quote to end early. Autoescaping has
+    to keep it from ending the *attribute* instead."""
     _add("Katz's Delicatessen", "place-katz")
+    _add('Say "Hi" <b>', "place-hi")
 
     body = client.get("/").get_data(as_text=True)
-    onsubmit = re.search(r"onsubmit='([^']+)'", body).group(1)
 
-    # The escape has to be the \u form: &#39; here would be a real quote by the
-    # time the JavaScript engine sees the attribute.
-    assert r"Katz\u0027s Delicatessen" in onsubmit
-    assert "&#39;" not in onsubmit
+    assert 'data-confirm-delete="Katz&#39;s Delicatessen"' in body
+    assert 'data-confirm-delete="Say &#34;Hi&#34; &lt;b&gt;"' in body
 
 
 def test_delete_removes_the_restaurant_and_its_history(client):
@@ -1284,7 +1283,7 @@ def test_check_now_refuses_an_archived_restaurant(client, monkeypatch):
     """Re-activating is how you resume checking one. Checking it in place
     would only archive it again on the same status."""
     restaurant_id = _add("Lilia", "place-lilia", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(restaurant_id)
+    archive_restaurant(restaurant_id)
     places, _, _ = _patch_check(monkeypatch)
 
     response = _post_check(client, restaurant_id)
@@ -1306,7 +1305,7 @@ def test_check_button_is_offered_only_where_the_post_would_be_honoured(client):
     active = _add("Lilia", "place-lilia")
     unverified = _add("Unsure", "place-unsure", verified=False)
     archived = _add("Gone", "place-gone", status="CLOSED_PERMANENTLY")
-    db.archive_restaurant(archived)
+    archive_restaurant(archived)
 
     body = client.get("/").get_data(as_text=True)
 
@@ -1364,6 +1363,7 @@ def test_logging_is_configured_when_nothing_has(monkeypatch):
     """`flask run` leaves the root logger without a handler, which drops
     every logger.info() in this module -- including the secret-key warning."""
     import logging
+
     import config
     root = logging.getLogger()
     monkeypatch.setattr(root, "handlers", [])
@@ -1377,6 +1377,7 @@ def test_logging_is_configured_when_nothing_has(monkeypatch):
 
 def test_existing_logging_is_left_alone(monkeypatch):
     import logging
+
     import config
     monkeypatch.setattr(logging.getLogger(), "handlers", [logging.NullHandler()])
     calls = []
@@ -1385,3 +1386,122 @@ def test_existing_logging_is_left_alone(monkeypatch):
     config.configure_logging()
 
     assert calls == []
+
+
+# --- hardening, paging, and the stash --------------------------------------
+
+def test_every_post_route_rejects_a_missing_token(client):
+    """The check is one before_request hook, so a route added later is
+    covered without remembering to ask. This walks the URL map rather than a
+    list of routes someone has to keep up to date."""
+    app = client.application
+    posts = [r for r in app.url_map.iter_rules() if "POST" in r.methods]
+    assert posts
+    for rule in posts:
+        url = rule.rule.replace("<int:restaurant_id>", "1")
+        assert client.post(url, data={}).status_code == 400, url
+
+
+def test_pages_carry_a_csp_and_no_inline_script_or_style(client):
+    _add("Lilia", "place-lilia", verified=False)
+    _add("Katz", "place-katz")
+
+    for url in ("/", "/restaurant/1"):
+        response = client.get(url)
+        body = response.get_data(as_text=True)
+        csp = response.headers["Content-Security-Policy"]
+        assert "script-src 'self'" in csp and "unsafe-inline" not in csp
+        assert "<style" not in body
+        assert " style=" not in body
+        assert "onsubmit=" not in body
+        assert not re.search(r"<script(?![^>]*\bsrc=)", body)
+
+
+def test_static_assets_are_served(client):
+    assert client.get("/static/style.css").status_code == 200
+    assert client.get("/static/app.js").status_code == 200
+
+
+def test_verify_selected_ignores_out_of_range_ids(client):
+    restaurant_id = _add("Lilia", "place-lilia", verified=False)
+    token = _csrf(client)
+
+    response = client.post("/verify-selected", data={
+        "csrf_token": token, "ids": [str(10**30), "-4", "0", str(restaurant_id)]})
+
+    assert response.status_code == 302
+    assert db.get_restaurant(restaurant_id)["verified_at"] is not None
+
+
+def test_the_index_is_paged_and_filterable(client, monkeypatch):
+    monkeypatch.setattr(dashboard, "PAGE_SIZE", 3)
+    for i in range(7):
+        _add(f"Place {i}", f"place-{i}")
+    _add("Katz", "place-katz")
+
+    first = client.get("/").get_data(as_text=True)
+    assert "Page 1 of 3" in first
+    assert first.count(">Delete<") == 3
+    # The summary still counts everything.
+    assert _stat(first, "Tracked") == 8
+
+    last = client.get("/?page=99").get_data(as_text=True)
+    assert "Page 3 of 3" in last
+    assert client.get("/?page=banana").status_code == 200
+
+    found = client.get("/?find=katz").get_data(as_text=True)
+    assert found.count(">Delete<") == 1
+    assert "1 match" in found
+    assert "No restaurant matches" in client.get("/?find=zzz").get_data(as_text=True)
+
+
+def test_the_verify_card_is_capped(client, monkeypatch):
+    monkeypatch.setattr(dashboard, "PENDING_SHOWN", 2)
+    for i in range(5):
+        _add(f"Place {i}", f"place-{i}", verified=False)
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert body.count('class="pick"') == 2
+    assert "Showing the first 2 of" in body
+    assert _stat(body, "To verify") == 5
+
+
+def test_an_expired_stash_is_not_confirmable(client):
+    token = _csrf(client)
+    db.stash_pending_add("old", {"name": "Lilia", "place_id": "place-lilia",
+                                 "address": "", "maps_url": "", "query": "lilia"})
+    with db.get_conn() as conn:
+        conn.execute("UPDATE pending_adds SET created_at = datetime('now', '-3 hours')")
+    with client.session_transaction() as sess:
+        sess["pending_add"] = "old"
+
+    client.post("/add/confirm", data={"csrf_token": token, "place_id": "place-lilia"})
+
+    assert db.get_restaurant_by_place_id("place-lilia") is None
+
+
+def test_create_app_takes_config_overrides(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_SECRET_KEY", "k")
+    app = dashboard.create_app({"TESTING": True, "MAX_CONTENT_LENGTH": 1234})
+    assert app.config["TESTING"] is True
+    assert app.config["MAX_CONTENT_LENGTH"] == 1234
+
+
+def test_check_now_reports_an_alert_that_could_not_be_sent(client, monkeypatch):
+    """The status is already recorded by then, so the flash must not claim
+    that nothing changed."""
+    restaurant_id = _add("Lilia", "place-lilia")
+    token = _csrf(client)
+
+    def _fail(restaurant, include_news_check=False):
+        raise checker.AlertNotSent("ntfy down")
+
+    monkeypatch.setattr(dashboard, "check_one", _fail)
+
+    response = client.post(f"/restaurant/{restaurant_id}/check",
+                           data={"csrf_token": token}, follow_redirects=True)
+
+    body = response.get_data(as_text=True)
+    assert "alert couldn&#39;t be sent" in body
+    assert "nothing was changed" not in body

@@ -25,9 +25,9 @@
       adding more. -#}
   {% if pending %}
     <div class="card pending">
-      <h2 style="margin: 0">{{ summary.unverified }}
+      <h2 class="m0">{{ summary.unverified }}
         restaurant{{ 's' if summary.unverified != 1 }} waiting to be verified</h2>
-      <p class="muted small" style="margin: .25rem 0 0">
+      <p class="muted small tight">
         Google answers a name search with exactly one guess and no confidence
         beside it, so a wrong match looks just like a right one. These aren't
         being checked at all until you confirm each is the place you meant.
@@ -53,27 +53,15 @@
               <div class="small"><a href="{{ r.maps_url }}" target="_blank"
                 rel="noopener noreferrer">Open on Google Maps</a> to be sure</div>
             {% endif %}
-            <div style="margin-top: .45rem">{{ verify_forms(r, 'index') }}</div>
+            <div class="mt-m">{{ verify_forms(r, 'index') }}</div>
           </li>
         {% endfor %}
       </ul>
+      {% if summary.unverified > pending|length %}
+        <p class="muted small tight">Showing the first {{ pending|length }} of
+          {{ summary.unverified }}. Verify these and the rest will follow.</p>
+      {% endif %}
     </div>
-    <script>
-      (function () {
-        var all = document.getElementById("select-all");
-        var form = document.getElementById("bulk-verify");
-        var picks = document.querySelectorAll("input.pick");
-        all.addEventListener("change", function () {
-          picks.forEach(function (p) { p.checked = all.checked; });
-        });
-        form.addEventListener("submit", function (e) {
-          var n = document.querySelectorAll("input.pick:checked").length;
-          if (n && !confirm("Confirm that " + n + " restaurant" + (n === 1 ? " is" : "s are") + " the right place?")) {
-            e.preventDefault();
-          }
-        });
-      })();
-    </script>
   {% endif %}
 
   {#- The one form on this site that costs money, so it says so, and it
@@ -90,10 +78,21 @@
            maxlength="{{ max_query_chars }}"
            placeholder="City or street (optional)" aria-label="City or street">
     <button class="action" type="submit">Search</button>
-    <p class="muted small" style="width: 100%; margin: 0">
+    <p class="muted small full-row">
       Looks the name up on Google Places &mdash; one paid search per click.
       You'll confirm the match before anything gets tracked.
     </p>
+  </form>
+
+  <form class="filter" method="get" action="{{ url_for('index') }}">
+    <input class="text" type="search" name="find" value="{{ find }}"
+           maxlength="{{ max_query_chars }}" placeholder="Filter by name or address"
+           aria-label="Filter the list">
+    <button class="action" type="submit">Filter</button>
+    {% if find %}
+      <a class="small" href="{{ url_for('index') }}">Clear</a>
+      <span class="muted small">{{ matching }} match{{ 'es' if matching != 1 }}</span>
+    {% endif %}
   </form>
 
   <div class="card">
@@ -121,7 +120,7 @@
             <td>
               {{ badges(r) }}
               {% if r.archived %}
-                <div style="margin-top: .35rem">{{ unarchive_form(r, 'index') }}</div>
+                <div class="mt-s">{{ unarchive_form(r, 'index') }}</div>
               {% endif %}
             </td>
             <td class="hide-narrow small">
@@ -145,11 +144,18 @@
           </tr>
         {% else %}
           <tr><td class="empty" colspan="4">
-            Nothing tracked yet &mdash; search for one above, or seed a whole list
-            with <code>python seed.py restaurants.txt</code>.
+            {% if find %}No restaurant matches &ldquo;{{ find }}&rdquo;.{% else %}Nothing tracked yet &mdash; search for one above, or seed a whole list
+            with <code>python seed.py restaurants.txt</code>.{% endif %}
           </td></tr>
         {% endfor %}
       </tbody>
     </table>
+    {% if pages > 1 %}
+      <nav class="pager small" aria-label="Pages">
+        {% if page > 1 %}<a href="{{ url_for('index', page=page - 1, find=find or None) }}">&larr; Previous</a>{% endif %}
+        <span class="muted">Page {{ page }} of {{ pages }}</span>
+        {% if page < pages %}<a href="{{ url_for('index', page=page + 1, find=find or None) }}">Next &rarr;</a>{% endif %}
+      </nav>
+    {% endif %}
   </div>
 {% endblock %}

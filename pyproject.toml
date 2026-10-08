@@ -1,0 +1,30 @@
+[project]
+name = "restaurant-watcher"
+version = "0.1.0"
+description = "Watches a list of restaurants for closures and alerts you."
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Comments in this codebase are prose; long lines in them are fine.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "checker", "closure_checker", "config", "db", "http_session",
+                     "main", "notifier", "places_client", "seed", "statuses"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["app.py", "checker.py", "closure_checker.py", "config.py", "db.py",
+         "http_session.py", "main.py", "notifier.py", "places_client.py", "seed.py",
+         "statuses.py"]
+ignore_missing_imports = true
+check_untyped_defs = true

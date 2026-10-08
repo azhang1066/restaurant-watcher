@@ -5,6 +5,7 @@ hard API field, so it's run less often than the Places status check
 (every CLOSING_SOON_CHECK_EVERY runs) to keep cost and noise down.
 """
 import json
+from typing import Any
 
 import anthropic
 
@@ -36,6 +37,8 @@ MAX_TOKENS = 1500
 MAX_CONTINUATIONS = 3
 
 CONFIDENCES = ("low", "medium", "high")
+# What check_one acts on; a "low" verdict is recorded but never alerts.
+TRUSTED_CONFIDENCES = ("medium", "high")
 
 
 class NewsCheckError(Exception):
@@ -52,31 +55,32 @@ Respond with ONLY a JSON object, no other text, in this exact shape:
 """
 
 
-def _model():
+def _model() -> str:
     """Read at call time for the same reason as `_client()`."""
     return env_str("CLOSURE_CHECK_MODEL", MODEL)
 
 
-def _client():
+def _client() -> anthropic.Anthropic:
     """Built at call time, not import time, so `.env` lands however this module
     was imported -- see `places_client._api_key()` for the same pattern. Reads
     ANTHROPIC_API_KEY from the environment."""
     return anthropic.Anthropic(max_retries=MAX_RETRIES, timeout=TIMEOUT_SECONDS)
 
 
-def check_closing_soon(name, address):
+def check_closing_soon(name: str, address: str | None) -> dict:
     """Raises if the API is still failing once the SDK's retries are spent, or
     NewsCheckError if the reply can't be read as a verdict --
     `checker.check_one` treats both as a failed news check and keeps the
     stored flag, rather than reading silence as "not closing"."""
     client = _client()
-    messages = [{"role": "user",
+    messages: list[Any] = [{"role": "user",
                  "content": PROMPT_TEMPLATE.format(name=name, address=address or "")}]
+    tools: Any = [{"type": WEB_SEARCH_TOOL, "name": "web_search"}]
     for _ in range(MAX_CONTINUATIONS + 1):
         resp = client.messages.create(
             model=_model(),
             max_tokens=MAX_TOKENS,
-            tools=[{"type": WEB_SEARCH_TOOL, "name": "web_search"}],
+            tools=tools,
             messages=messages,
         )
         if resp.stop_reason != "pause_turn":

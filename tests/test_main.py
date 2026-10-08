@@ -19,6 +19,9 @@ docstrings what the old behaviour was, since that's what they exist to stop
 coming back.
 """
 import logging
+from datetime import UTC
+
+from helpers import archive_restaurant
 
 import checker
 import db
@@ -46,11 +49,10 @@ def _setup(tmp_path, monkeypatch, restaurants=(("Lilia", "place-lilia"),),
     quietly turn every notification test below into a test that nothing is
     checked at all. The tests that *are* about that opt in explicitly.
     """
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
-    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
     for var in ("CLOSING_SOON_CHECK_EVERY", "CHECK_LOG_RETAIN_DAYS", "HEALTHCHECK_URL"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.delenv("BACKUPS_KEPT", raising=False)
+    # Backups copy the whole database on every run; off unless a test asks.
+    monkeypatch.setenv("BACKUPS_KEPT", "0")
     # Never let a failing check in these tests push to the real ntfy topic.
     _patch_problem_notifier(monkeypatch)
     db.init_db()
@@ -536,9 +538,9 @@ def test_failure_is_logged_with_a_traceback(tmp_path, monkeypatch, caplog):
 
 
 def test_notifier_failure_does_not_abort_the_run(tmp_path, monkeypatch):
-    """A dead ntfy fails that one restaurant's check and leaves its row
-    untouched -- so the next run sees the same transition and retries the
-    alert -- while the others are still checked."""
+    """A dead ntfy fails that one restaurant's alert but not the run: the
+    result is recorded with the alert still pending, the others are checked,
+    and the next run delivers the alert before anything else."""
     _setup(tmp_path, monkeypatch, restaurants=(
         ("Lilia", "place-lilia"),
         ("Don Angie", "place-angie"),
@@ -552,15 +554,75 @@ def test_notifier_failure_does_not_abort_the_run(tmp_path, monkeypatch):
 
     main.run_check(include_news_check=False)  # must not raise
 
-    assert _row("Lilia")["business_status"] == "OPERATIONAL"
-    assert _row("Lilia")["last_checked_at"] is None
+    assert _row("Lilia")["business_status"] == "CLOSED_TEMPORARILY"
+    assert _row("Lilia")["pending_alert"] == "closed"
     assert _row("Don Angie")["last_checked_at"] is not None
 
-    # ntfy recovers: the closure is announced on the next run.
+    # ntfy recovers: the closure is announced once, on the next run, and the
+    # now-unchanged status doesn't announce it a second time.
     closed, _ = _patch_notifiers(monkeypatch)
     main.run_check(include_news_check=False)
     assert closed == [("Lilia", "CLOSED_TEMPORARILY")]
-    assert _row("Lilia")["business_status"] == "CLOSED_TEMPORARILY"
+    assert _row("Lilia")["pending_alert"] is None
+    main.run_check(include_news_check=False)
+    assert closed == [("Lilia", "CLOSED_TEMPORARILY")]
+
+
+def test_a_pending_alert_for_an_archived_row_is_still_delivered(tmp_path, monkeypatch):
+    """A permanent closure archives the row in the same write that records its
+    alert, so the retry has to look at archived rows too."""
+    _setup(tmp_path, monkeypatch)
+    _patch_places(monkeypatch, {"place-lilia": "CLOSED_PERMANENTLY"})
+    _patch_notifiers(monkeypatch, closed_raises=RuntimeError("ntfy down"))
+    _patch_news(monkeypatch)
+    main.run_check(include_news_check=False)
+    assert _row("Lilia")["archived"] == 1
+    assert _row("Lilia")["pending_alert"] == "closed"
+
+    closed, _ = _patch_notifiers(monkeypatch)
+    main.run_check(include_news_check=False)
+
+    assert closed == [("Lilia", "CLOSED_PERMANENTLY")]
+    assert _row("Lilia")["pending_alert"] is None
+
+
+def test_an_auth_error_aborts_the_run(tmp_path, monkeypatch):
+    from places_client import PlacesAuthError
+    names = [(f"R{i}", f"p{i}") for i in range(5)]
+    _setup(tmp_path, monkeypatch, restaurants=names)
+    calls = _patch_places(monkeypatch, {p: PlacesAuthError("403") for _, p in names})
+    problems = _patch_problem_notifier(monkeypatch)
+    _patch_notifiers(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert len(calls) == 1
+    assert problems == [(5, 5, [])]
+
+
+def test_a_streak_of_failures_aborts_the_run(tmp_path, monkeypatch):
+    n = main.MAX_CONSECUTIVE_FAILURES + 5
+    names = [(f"R{i}", f"p{i}") for i in range(n)]
+    _setup(tmp_path, monkeypatch, restaurants=names)
+    calls = _patch_places(monkeypatch, {p: RuntimeError("network down") for _, p in names})
+    problems = _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert len(calls) == main.MAX_CONSECUTIVE_FAILURES
+    assert problems == [(n, n, [])]
+
+
+def test_a_missing_place_does_not_count_towards_the_streak(tmp_path, monkeypatch):
+    n = main.MAX_CONSECUTIVE_FAILURES + 5
+    names = [(f"R{i}", f"p{i}") for i in range(n)]
+    _setup(tmp_path, monkeypatch, restaurants=names)
+    calls = _patch_places(monkeypatch, {p: PlaceNotFound(p) for _, p in names})
+    _patch_problem_notifier(monkeypatch)
+
+    main.run_check(include_news_check=False)
+
+    assert len(calls) == n
 
 
 def test_a_crashed_run_does_not_advance_the_run_counter(tmp_path, monkeypatch):
@@ -581,9 +643,16 @@ def test_a_crashed_run_does_not_advance_the_run_counter(tmp_path, monkeypatch):
 
 def test_a_corrupt_run_counter_reads_as_zero(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    (tmp_path / ".run_count").write_text("not a number")
+    db.set_meta("run_count", "not a number")
 
     assert main._read_run_count() == 0
+
+
+def test_a_run_counter_from_the_old_file_is_picked_up(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    (tmp_path / ".run_count").write_text("7")
+
+    assert main._read_run_count() == 7
 
 
 def test_check_one_refuses_unverified_and_archived_rows(tmp_path, monkeypatch):
@@ -754,7 +823,7 @@ def test_archived_unverified_restaurant_is_not_nagged_about(tmp_path, monkeypatc
     """run_check only ever reads the active list, so an archived row can't be
     pushed about -- the dashboard's "needs verifying" has to agree."""
     _setup(tmp_path, monkeypatch, verified=False)
-    db.archive_restaurant(_row("Lilia")["id"])
+    archive_restaurant(_row("Lilia")["id"])
     _patch_places(monkeypatch, {})
     _patch_news(monkeypatch)
     _patch_notifiers(monkeypatch)
@@ -814,6 +883,7 @@ def test_a_dead_failure_push_does_not_fail_the_run(tmp_path, monkeypatch):
 
 def test_a_run_backs_up_the_database(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("BACKUPS_KEPT", "8")
     _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
     _patch_notifiers(monkeypatch)
 
@@ -824,7 +894,6 @@ def test_a_run_backs_up_the_database(tmp_path, monkeypatch):
 
 def test_backups_can_be_disabled(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    monkeypatch.setenv("BACKUPS_KEPT", "0")
     _patch_places(monkeypatch, {"place-lilia": "OPERATIONAL"})
     _patch_notifiers(monkeypatch)
 
@@ -926,48 +995,49 @@ def test_healthcheck_posts_to_fail_endpoint(monkeypatch):
     assert urls == ["https://hc.example/ping/abc", "https://hc.example/ping/abc/fail"]
 
 
-def test_scheduler_first_fires_now_when_there_has_been_no_run(tmp_path, monkeypatch):
+def _utcnow():
     from datetime import datetime
-    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
-    now = datetime.now()
+    return datetime.now(UTC)
+
+
+def _set_last_run(days_ago):
+    from datetime import timedelta
+    db.set_meta("last_run_at", (_utcnow() - timedelta(days=days_ago)).isoformat())
+
+
+def test_scheduler_first_fires_now_when_there_has_been_no_run(tmp_path, monkeypatch):
+    db.init_db()
+    now = _utcnow()
     assert main._next_run_time(now) == now
 
 
 def test_scheduler_waits_out_the_week_after_a_recent_run(tmp_path, monkeypatch):
-    from datetime import datetime, timedelta
-    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    from datetime import timedelta
+    db.init_db()
     main._write_run_count(1)
-    now = datetime.now()
+    now = _utcnow()
     nxt = main._next_run_time(now)
     assert timedelta(days=6) < nxt - now <= timedelta(weeks=1)
 
 
 def test_scheduler_fires_now_when_the_last_run_is_over_a_week_old(tmp_path, monkeypatch):
-    import os
-    import time
-    from datetime import datetime
-    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    db.init_db()
     main._write_run_count(1)
-    old = time.time() - 8 * 86400
-    os.utime(main._run_count_file, (old, old))
-    now = datetime.now()
+    _set_last_run(8)
+    now = _utcnow()
     assert main._next_run_time(now) == now
 
 
 def test_restart_after_a_long_gap_notifies(tmp_path, monkeypatch):
-    import os
-    import time
-    from datetime import datetime
-    monkeypatch.setattr(main, "_run_count_file", str(tmp_path / ".run_count"))
+    db.init_db()
     sent = []
     monkeypatch.setattr(main, "notify_scheduler_gap", sent.append)
 
-    main._warn_if_scheduler_was_down(datetime.now())  # never ran: nothing to report
+    main._warn_if_scheduler_was_down(_utcnow())  # never ran: nothing to report
     main._write_run_count(1)
-    main._warn_if_scheduler_was_down(datetime.now())  # just ran
+    main._warn_if_scheduler_was_down(_utcnow())  # just ran
     assert sent == []
 
-    old = time.time() - 20 * 86400
-    os.utime(main._run_count_file, (old, old))
-    main._warn_if_scheduler_was_down(datetime.now())
+    _set_last_run(20)
+    main._warn_if_scheduler_was_down(_utcnow())
     assert sent == [20]

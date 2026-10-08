@@ -4,11 +4,14 @@ Essentials/Pro tier, so a weekly check of a few hundred places costs cents.
 Avoid adding rating/hours/photos/phone fields here; those bump every call
 to the Enterprise SKU.
 """
-import requests
+import logging
+from urllib.parse import quote
 
 from config import env_str
 from http_session import retrying_session
-from statuses import OPERATIONAL
+from statuses import ALL_STATUSES, OPERATIONAL, UNSPECIFIED
+
+logger = logging.getLogger(__name__)
 
 PLACES_BASE = "https://places.googleapis.com/v1"
 
@@ -23,14 +26,25 @@ class PlaceNotFound(Exception):
     """
 
 
-def _api_key():
+class PlacesAuthError(Exception):
+    """Places refused the API key (401/403): bad, restricted or over quota.
+    Every remaining request in a run would fail the same way."""
+
+
+def _api_key() -> str:
     key = env_str("GOOGLE_PLACES_API_KEY")
     if not key:
         raise RuntimeError("Set GOOGLE_PLACES_API_KEY in your environment / .env")
     return key
 
 
-def find_place_id(name, address_hint=""):
+def _raise_for_status(resp) -> None:
+    if resp.status_code in (401, 403):
+        raise PlacesAuthError(f"Places API answered {resp.status_code}: {resp.text[:200]}")
+    resp.raise_for_status()
+
+
+def find_place_id(name: str, address_hint: str = "") -> dict | None:
     """Resolve a restaurant name (+ optional address/neighborhood) to a place_id
     via Text Search. Used by seed.py and the dashboard's add form."""
     url = f"{PLACES_BASE}/places:searchText"
@@ -41,12 +55,12 @@ def find_place_id(name, address_hint=""):
     }
     query = f"{name} {address_hint}".strip()
     resp = _session.post(url, headers=headers, json={"textQuery": query}, timeout=15)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     places = resp.json().get("places", [])
     return places[0] if places else None
 
 
-def place_summary(place, fallback_name=""):
+def place_summary(place: dict, fallback_name: str = "") -> dict:
     """Flatten a Text Search result into the fields db.add_restaurant() takes.
 
     Shared by seed.py and the dashboard's add flow so the two can't disagree
@@ -62,9 +76,14 @@ def place_summary(place, fallback_name=""):
     }
 
 
-def get_business_status(place_id):
-    """Cheap status check: id + businessStatus + displayName only."""
-    url = f"{PLACES_BASE}/places/{place_id}"
+def get_business_status(place_id: str) -> str:
+    """Cheap status check: id + businessStatus + displayName only.
+
+    A value outside statuses.ALL_STATUSES (Google adding one) comes back as
+    UNSPECIFIED, logged: the database would refuse to store it, and the row
+    would then fail every run.
+    """
+    url = f"{PLACES_BASE}/places/{quote(place_id, safe='')}"
     headers = {
         "X-Goog-Api-Key": _api_key(),
         "X-Goog-FieldMask": "id,businessStatus,displayName",
@@ -72,6 +91,10 @@ def get_business_status(place_id):
     resp = _session.get(url, headers=headers, timeout=15)
     if resp.status_code == 404:
         raise PlaceNotFound(place_id)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("businessStatus", OPERATIONAL)
+    _raise_for_status(resp)
+    status = resp.json().get("businessStatus", OPERATIONAL)
+    if status not in ALL_STATUSES:
+        logger.warning("Places returned an unknown businessStatus %r for %s -- "
+                       "recording it as %s", status, place_id, UNSPECIFIED)
+        return UNSPECIFIED
+    return status

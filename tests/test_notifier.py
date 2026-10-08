@@ -7,6 +7,8 @@ at call time is the fix; these tests pin it down by setting the environment
 import smtplib
 from email.header import decode_header, make_header
 
+import pytest
+
 import notifier
 
 
@@ -323,3 +325,56 @@ def test_run_problems_push_is_high_priority_when_everything_failed(monkeypatch):
     notifier.notify_run_problems(3, 3, [])
 
     assert posts[0]["headers"]["Priority"] == "high"
+
+
+# --- delivery across channels ----------------------------------------------------
+
+def _email_env(monkeypatch):
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("EMAIL_FROM", "a@example.com")
+    monkeypatch.setenv("EMAIL_TO", "b@example.com")
+
+
+def _ntfy_down(monkeypatch):
+    def _boom(url, **kwargs):
+        raise OSError("ntfy unreachable")
+
+    monkeypatch.setattr(notifier._session, "post", _boom)
+
+
+def test_email_still_goes_out_when_ntfy_is_down(monkeypatch):
+    _clear_email_env(monkeypatch)
+    monkeypatch.setenv("NTFY_TOPIC", "private-topic")
+    _ntfy_down(monkeypatch)
+    fake = _patch_smtp(monkeypatch)
+    _email_env(monkeypatch)
+
+    notifier.notify("Title", "Body")  # delivered by email: must not raise
+
+    assert len(fake.instances[0].sent) == 1
+
+
+def test_notify_raises_when_ntfy_is_down_and_there_is_no_email(monkeypatch):
+    _clear_email_env(monkeypatch)
+    monkeypatch.setenv("NTFY_TOPIC", "private-topic")
+    _ntfy_down(monkeypatch)
+
+    with pytest.raises(OSError):
+        notifier.notify("Title", "Body")
+
+
+def test_notify_raises_when_both_channels_fail(monkeypatch):
+    _clear_email_env(monkeypatch)
+    monkeypatch.setenv("NTFY_TOPIC", "private-topic")
+    _ntfy_down(monkeypatch)
+    _email_env(monkeypatch)
+    monkeypatch.setattr(smtplib, "SMTP", lambda *a, **k: 1 / 0)
+
+    with pytest.raises(OSError):
+        notifier.notify("Title", "Body")
+
+
+def test_names_summary_collapses_past_the_limit():
+    names = [f"R{i}" for i in range(8)]
+    assert notifier._names_summary(names[:2]) == "R0, R1"
+    assert notifier._names_summary(names) == "R0, R1, R2, R3, R4, and 3 more"

@@ -38,7 +38,6 @@ def test_seeded_restaurants_are_not_verified(tmp_path, monkeypatch):
     """Seeding resolves a file of names with nobody looking at any of them,
     which is the whole reason the verification gate exists. If these landed
     verified, run_check would start checking place_ids no one had ever seen."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(
         places_client, "find_place_id",
         lambda name, hint="": {"id": f"place-{name.strip().lower()}",
@@ -58,7 +57,6 @@ def test_seeded_restaurants_are_not_verified(tmp_path, monkeypatch):
 
 def test_a_line_with_no_match_is_skipped_not_fatal(tmp_path, monkeypatch):
     """One unresolvable name in a long file shouldn't cost the rest of it."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(
         seed, "find_place_id",
         lambda name, hint="": None if name.strip() == "Nowhere" else {
@@ -79,7 +77,6 @@ def _place(name, place_id=None):
 
 
 def test_a_failed_lookup_does_not_abort_the_rest_of_the_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
 
     def _find(name, hint=""):
         if name == "Boom":
@@ -98,7 +95,6 @@ def test_a_failed_lookup_does_not_abort_the_rest_of_the_file(tmp_path, monkeypat
 
 
 def test_reseeding_does_not_search_for_names_already_tracked(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     searches = []
 
     def _find(name, hint=""):
@@ -119,7 +115,6 @@ def test_reseeding_does_not_search_for_names_already_tracked(tmp_path, monkeypat
 
 
 def test_a_hint_forces_a_search_even_for_a_tracked_name(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(seed, "find_place_id",
                         lambda name, hint="": _place(name, f"place-{hint or 'main'}"))
     listing = tmp_path / "restaurants.txt"
@@ -131,7 +126,6 @@ def test_a_hint_forces_a_search_even_for_a_tracked_name(tmp_path, monkeypatch):
 
 
 def test_a_utf8_file_with_a_bom_is_read_cleanly(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(seed, "find_place_id", lambda name, hint="": _place(name))
     listing = tmp_path / "restaurants.txt"
     listing.write_bytes("\ufeffCafé Boulud\n".encode("utf-8"))
