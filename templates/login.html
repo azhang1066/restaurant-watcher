@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Sign in &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Restaurant Watcher</h1>
+  {% if not has_login and signup_open %}
+    <p class="sub">No accounts yet &mdash; create the first one below.</p>
+  {% endif %}
+  <form class="add stack card" method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="username">Username</label>
+    <input class="text" type="text" id="username" name="username" required
+           autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+    <label for="password">Password</label>
+    <input class="text" type="password" id="password" name="password" required
+           autocomplete="current-password">
+    <button class="action" type="submit">Sign in</button>
+  </form>
+  {% if signup_open %}
+    <p class="small mt-m">New here? <a href="{{ url_for('signup') }}">Create an account</a></p>
+  {% endif %}
+{% endblock %}

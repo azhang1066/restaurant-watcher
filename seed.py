@@ -10,7 +10,10 @@ guess. Nothing here is checked until it's confirmed on the dashboard -- see
 main.run_check().
 
 Usage:
-    python seed.py restaurants.txt
+    python seed.py restaurants.txt [--user NAME]
+
+Rows go into one user's list. --user is optional while there is at most one
+account (with none yet, the first account made adopts them).
 
 Where restaurants.txt has one restaurant per line, e.g.:
     Lilia, Brooklyn NY
@@ -21,7 +24,15 @@ import logging
 import sys
 
 import config  # noqa: F401 -- importing it is what loads .env
-from db import add_restaurant, get_restaurant_by_place_id, init_db, list_restaurants
+from db import (
+    add_restaurant,
+    count_users,
+    get_restaurant_by_place_id,
+    get_user_by_name,
+    init_db,
+    list_restaurants,
+    list_users,
+)
 from places_client import find_place_id, place_summary
 
 logger = logging.getLogger(__name__)
@@ -34,7 +45,7 @@ def _parse_line(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def seed_from_file(path: str) -> dict:
+def seed_from_file(path: str, user_id: int | None = None) -> dict:
     """Resolve each line and add it. Returns a dict of counts: added,
     existing, no_match, failed.
 
@@ -43,7 +54,8 @@ def seed_from_file(path: str) -> dict:
     line is skipped *without* searching when the file repeats it, or when it
     has no address hint and a restaurant with that exact name (ignoring case)
     is already tracked. Add a city or street to a line to force the search
-    for a second location of the same name.
+    for a second location of the same name. Everything is scoped to `user_id`'s
+    list, so someone else watching the same place doesn't count as tracked.
     """
     init_db()
     # utf-8-sig: Windows editors prepend a BOM, which would otherwise glue
@@ -51,7 +63,8 @@ def seed_from_file(path: str) -> dict:
     with open(path, encoding="utf-8-sig") as f:
         lines = [line.strip() for line in f if line.strip()]
 
-    known_names = {r["name"].lower() for r in list_restaurants(active_only=False)}
+    known_names = {r["name"].lower()
+                   for r in list_restaurants(active_only=False, user_id=user_id)}
     seen_lines = set()
     counts = {"added": 0, "existing": 0, "no_match": 0, "failed": 0}
 
@@ -80,11 +93,11 @@ def seed_from_file(path: str) -> dict:
             continue
 
         fields = place_summary(place, fallback_name=name)
-        if get_restaurant_by_place_id(fields["place_id"]) is not None:
+        if get_restaurant_by_place_id(fields["place_id"], user_id) is not None:
             logger.info("  = already tracked: %s", fields["name"])
             counts["existing"] += 1
             continue
-        add_restaurant(**fields)
+        add_restaurant(**fields, user_id=user_id)
         known_names.add(fields["name"].lower())
         counts["added"] += 1
         logger.info("  ✓ added: %s — %s", fields["name"], fields["address"] or "no address")
@@ -97,8 +110,24 @@ def seed_from_file(path: str) -> dict:
 if __name__ == "__main__":
     # Bare messages: this is a CLI's progress output, not a log.
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    if len(sys.argv) != 2:
-        sys.exit("Usage: python seed.py restaurants.txt")
+    args = sys.argv[1:]
+    username = None
+    if len(args) == 3 and args[1] == "--user":
+        args, username = args[:1], args[2]
+    if len(args) != 1:
+        sys.exit("Usage: python seed.py restaurants.txt [--user NAME]")
+    init_db()
+    if username is not None:
+        user = get_user_by_name(username)
+        if user is None:
+            sys.exit(f"No account named {username!r}.")
+        owner = user["id"]
+    elif count_users() > 1:
+        sys.exit("More than one account exists -- say whose list with --user NAME.")
+    else:
+        owner = None
+        if count_users() == 1:
+            owner = next(iter(list_users()))["id"]
     # Non-zero when a lookup errored, so a script can tell "some lines didn't
     # resolve" (normal) from "Places was failing" (re-run it).
-    sys.exit(1 if seed_from_file(sys.argv[1])["failed"] else 0)
+    sys.exit(1 if seed_from_file(args[0], owner)["failed"] else 0)

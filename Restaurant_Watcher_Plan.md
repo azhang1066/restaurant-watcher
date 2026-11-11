@@ -24,6 +24,7 @@ Flat layout, one module per role:
 | `notifier.py` | ntfy + optional SMTP, healthcheck ping. |
 | `app.py`, `templates/`, `static/` | Flask dashboard. `static/app.js` holds the delete confirm and the lock-on-submit for POST forms. |
 | `seed.py` | Bulk-add from a text file (rows land unverified). |
+| `auth.py` | Accounts: login, sign-up rules, loopback-binding guard, in-memory rate limiter. |
 | `config.py`, `statuses.py`, `http_session.py` | Env helpers + logging, status constants/labels, the shared retry policy. |
 
 ## 2. Design decisions worth keeping
@@ -47,6 +48,17 @@ Flat layout, one module per role:
   forms lock their buttons on submit as a convenience. The budgets count dashboard presses only —
   refusing a scheduled check would silently stop the watching, and the dashboard never calls Claude,
   so there is no Claude budget. Provider quotas are the backstop (section 4).
+- **Auth is a login on every page, with in-UI sign-up, and every list is private.** Threat model: a few
+  trusted people on several devices. Accounts (hashed passwords) live in the `users` table, so one
+  works everywhere. `restaurants.user_id` owns each row, and every dashboard query goes through
+  `app._uid()` so a request can't read or change another list (another's id is a 404); the scheduler,
+  `seed.py` and tests pass no user and see every row. The first account adopts rows that predate
+  accounts. Open sign-up on a reachable server would hand strangers the money-spending buttons, so
+  `serve()` refuses a non-loopback host unless sign-up takes a code or is off. TLS is the proxy's job,
+  so the cookie's `Secure` flag and `X-Forwarded-For` trust are opt-in settings rather than defaults.
+- **Alerts follow the list's owner.** ntfy goes to the owner's own topic (Settings), falling back to
+  `NTFY_TOPIC`; email is one address for the whole install, and run-level pushes (failures, scheduler
+  gap) go to the install's topic. The spend budgets stay global.
 - **Destruction is graded:** archive (a closure; reversible), reject (an unverified wrong match;
   history deleted), delete (anything; confirm dialog, logged with the place_id).
 - **Watching the watcher.** A dead scheduler can't report itself: `HEALTHCHECK_URL` is pinged after
@@ -68,13 +80,13 @@ Flat layout, one module per role:
 
 ## 4. Known gaps and risks
 
-- **No auth.** The dashboard binds to localhost and is served by Flask's dev server. That is fine
-  until anyone wants it on a phone — at which point the list stops being local-only data, and the
-  buttons that spend money (Search, Check now) and destroy history (Delete) stop being harmless.
+- **Auth has no TLS of its own, no password reset, and no way to change a password or remove an account in the UI.** Exposing the dashboard needs HTTPS
+  from a proxy or tunnel in front (README, "Reaching it from a phone"). The login and per-IP rate
+  limits are in-process memory, so they reset on restart and assume one dashboard process.
 - **Provider-side spend caps are manual and unconfirmed.** The in-app limits (section 2) don't stop
   a bug in the app or the scheduler itself. Set the Google Cloud Places quota + billing budget alert
   and the Anthropic monthly limit (README, "Spending limits"), then delete this line. There is
-  still no per-IP rate limit, which only matters once the dashboard is exposed.
+  Per-IP limits only slow button-mashing down; they aren't a spend cap.
 - **Serial checks.** One restaurant at a time, with retry backoff. Fine at the current size;
   the first thing to revisit is `concurrent.futures`, or per-restaurant cadence.
 - **The needs-verifying push repeats every run** while anything is unverified. By design (those
@@ -90,11 +102,7 @@ Flat layout, one module per role:
 
 ## 5. Work plan
 
-### Phase 1 — Auth (the blocker for serving beyond localhost)
-Needed before the dashboard is reachable from a phone. Settle the threat model first (single user,
-a reverse proxy with its own auth, or app-level login), then add a per-IP rate limit on Search / Check now and replace the dev server with a WSGI server.
-
-### Phase 2 — Scale polish (only once the list outgrows a serial loop)
+### Phase 1 — Scale polish (only once the list outgrows a serial loop)
 - Concurrency in the per-restaurant loop, or batched status checks if Places ever supports them.
 - Per-restaurant cadence (e.g. news-check flagged restaurants more often).
 - Move the lock and run state wholly into the database if a second host ever runs the scheduler.

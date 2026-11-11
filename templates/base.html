@@ -9,6 +9,14 @@
 </head>
 <body>
   <main>
+    {% if current_user %}
+      <form class="signout" method="post" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <span class="small muted">{{ current_user.username }} &middot;
+          <a href="{{ url_for('settings') }}">Settings</a></span>
+        <button class="action" type="submit">Sign out</button>
+      </form>
+    {% endif %}
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         <ul class="flashes">

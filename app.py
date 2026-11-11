@@ -41,6 +41,14 @@ is real, so it's the only one that asks the browser to confirm first. Archiving
 is the softer option, and what a closure triggers on its own: the row and its
 history stay on the page, greyed out.
 
+Login: every page but /login needs a signed-in session, and failed logins are
+throttled per client IP. Accounts are made on /signup (gated by DASHBOARD_SIGNUP_CODE,
+or closed with DASHBOARD_SIGNUP=off, or `python app.py create-user`). Every
+restaurant belongs to one account and every query here is scoped to the signed-in
+one (`_uid()`), so nobody sees or changes another's list. Alerts go to that
+account's own ntfy topic (/settings). Search and Check now also carry a per-IP rate limit
+(`DASHBOARD_ACTIONS_PER_MINUTE`) in front of the daily budgets. See auth.py.
+
 Every POST is CSRF-checked in one `before_request` hook -- see `_require_csrf`
 -- against a token tied to the session. That needs a signing key, so set
 `DASHBOARD_SECRET_KEY` in `.env` to choose the key; without one a generated
@@ -52,19 +60,34 @@ There's deliberately no module-level `app`: Flask's loader finds the
 `init_db()` against the real database just for importing this module.
 
 Run it:
-    flask --app app run     # http://127.0.0.1:5000
-    python app.py           # same, explicit host/port
+    python app.py                  # waitress on DASHBOARD_HOST:DASHBOARD_PORT
+    python app.py create-user       # make an account from the terminal
+    flask --app app run            # dev server, localhost only
 """
 import hmac
 import logging
 import math
 import secrets
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
-from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.wrappers import Response
 
+import auth
 import db
 from checker import AlertNotSent, check_one, is_checkable
 from config import (
@@ -90,6 +113,7 @@ from db import (
     verify_restaurant,
     verify_restaurants,
 )
+from notifier import valid_topic
 from places_client import PlaceNotFound, find_place_id, place_summary
 from statuses import CLOSED_PERMANENTLY, CLOSED_STATUSES, CLOSED_TEMPORARILY, LABELS, OPERATIONAL
 
@@ -135,6 +159,16 @@ _STATUS_RANK = {CLOSED_PERMANENTLY: 0, CLOSED_TEMPORARILY: 1, OPERATIONAL: 2}
 
 # Where a generated signing key is kept, beside the database.
 SECRET_KEY_FILE = ".dashboard_secret"
+
+# Endpoints that spend money, rate-limited per client IP.
+_SPENDING_ENDPOINTS = frozenset({"add_search", "check_now"})
+DEFAULT_ACTIONS_PER_MINUTE = 10
+
+# Tests turn the login off wholesale (conftest); nothing in production does.
+LOGIN_DISABLED = False
+
+# A signed-in session lasts this long.
+SESSION_DAYS = 30
 
 _CSP = ("default-src 'none'; style-src 'self'; script-src 'self'; "
         "img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -194,6 +228,58 @@ def _require_csrf() -> None:
     provided = request.form.get("csrf_token", "")
     if not expected or not hmac.compare_digest(str(expected), provided):
         abort(400, "CSRF token missing or stale -- reload the page and retry.")
+
+
+def _client_ip() -> str:
+    return request.remote_addr or "unknown"
+
+
+def _require_login():
+    """Send anyone without a signed-in session to the login page.
+
+    Registered first, so nothing else (not even the CSRF check) runs for a
+    stranger, and load the signed-in user into `g.user`. A session whose
+    account no longer exists counts as signed out.
+    """
+    if LOGIN_DISABLED:
+        return None
+    user = _session_user()
+    if user is not None:
+        g.user = user
+        return None
+    if request.endpoint in ("login", "signup", "static"):
+        return None
+    session.pop("user_id", None)
+    return redirect(url_for("login"))
+
+
+def _session_user() -> dict | None:
+    user_id = session.get("user_id")
+    return db.get_user(user_id) if isinstance(user_id, int) else None
+
+
+def _uid() -> int | None:
+    """Whose list this request is about. Every dashboard query passes it, so
+    one user's rows can't be read or changed through another's session. None
+    only when the login is switched off (tests), meaning every list."""
+    return None if LOGIN_DISABLED else g.user["id"]
+
+
+def _sign_in(user_id: int) -> None:
+    # A fresh session on privilege change: nothing minted before login (the
+    # CSRF token included) carries over.
+    session.clear()
+    session["user_id"] = user_id
+    session.permanent = True
+
+
+def _rate_limit_spending():
+    if request.method != "POST" or request.endpoint not in _SPENDING_ENDPOINTS:
+        return None
+    if not current_app.extensions["action_limiter"].hit(_client_ip()):
+        logger.warning("Rate limit hit on %s from %s", request.endpoint, _client_ip())
+        abort(429, "Too many requests -- wait a minute and try again.")
+    return None
 
 
 def _security_headers(response: Response) -> Response:
@@ -330,9 +416,86 @@ def _int_arg(name: str, default: int) -> int:
 # Registered by create_app() from _URLS at the bottom of this module.
 
 
+def login():
+    if LOGIN_DISABLED or "user" in g:
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        limiter = current_app.extensions["login_limiter"]
+        ip = _client_ip()
+        if limiter.blocked(ip):
+            logger.warning("Login throttled for %s", ip)
+            abort(429, "Too many failed sign-ins -- try again in a few minutes.")
+        user = auth.authenticate(request.form.get("username", ""), request.form.get("password", ""))
+        if user is not None:
+            _sign_in(user["id"])
+            return redirect(url_for("index"))
+        limiter.hit(ip)
+        logger.warning("Failed login from %s", ip)
+        flash("Wrong username or password.", "warn")
+        return redirect(url_for("login"))
+    return render_template("login.html", has_login=auth.has_login(),
+                           signup_open=auth.signup_mode() != "closed")
+
+
+def signup():
+    """Create an account, then sign it in. Closed entirely by
+    DASHBOARD_SIGNUP=off; with DASHBOARD_SIGNUP_CODE set it also asks for the
+    code. Throttled per IP because a guessable code is the only gate."""
+    mode = auth.signup_mode()
+    if LOGIN_DISABLED or "user" in g or mode == "closed":
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        ip = _client_ip()
+        if not current_app.extensions["signup_limiter"].hit(ip):
+            logger.warning("Sign-up throttled for %s", ip)
+            abort(429, "Too many sign-up attempts -- try again later.")
+        if not auth.signup_code_ok(request.form.get("code", "")):
+            logger.warning("Wrong sign-up code from %s", ip)
+            flash("That sign-up code is wrong.", "warn")
+            return redirect(url_for("signup"))
+        user_id, error = auth.create_account(request.form.get("username", ""),
+                                             request.form.get("password", ""),
+                                             request.form.get("confirm", ""))
+        if user_id is None:
+            flash(error or "Couldn't create the account.", "warn")
+            return redirect(url_for("signup"))
+        logger.info("New account %r from %s", request.form.get("username", "").strip(), ip)
+        _sign_in(user_id)
+        return redirect(url_for("index"))
+    return render_template("signup.html", needs_code=mode == "code",
+                           min_password=auth.MIN_PASSWORD_CHARS)
+
+
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+def settings():
+    """The signed-in user's own alert topic. ntfy topics are public, so the
+    name is the secret: it must be long and unguessable, and is never shown to
+    anyone else. Empty means "use the install's NTFY_TOPIC"."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        topic = request.form.get("ntfy_topic", "").strip()
+        if not topic:
+            db.set_ntfy_topic(g.user["id"], None)
+            flash("Alert topic cleared -- alerts use the install's default topic, if any.",
+                  "info")
+        elif valid_topic(topic):
+            db.set_ntfy_topic(g.user["id"], topic)
+            flash("Alert topic saved. Subscribe to it in the ntfy app.", "info")
+        else:
+            flash("A topic is 8-64 letters, numbers, dashes or underscores -- long and "
+                  "unguessable, since anyone who knows it can read your alerts.", "warn")
+        return redirect(url_for("settings"))
+    return render_template("settings.html", topic=g.user["ntfy_topic"] or "")
+
+
 def index():
     now = datetime.now(UTC)
-    views = sorted((_view(r, now) for r in list_restaurants(active_only=False)),
+    views = sorted((_view(r, now) for r in list_restaurants(active_only=False, user_id=_uid())),
                    key=_sort_key)
     active = [v for v in views if not v["archived"]]
     pending = [v for v in views if v["needs_verification"]]
@@ -381,7 +544,7 @@ def _back_to(restaurant_id: int) -> Response:
 
 
 def detail(restaurant_id: int):
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         abort(404)
     return render_template(
@@ -392,7 +555,7 @@ def detail(restaurant_id: int):
 
 
 def unarchive(restaurant_id: int):
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         abort(404)
 
@@ -403,7 +566,7 @@ def unarchive(restaurant_id: int):
         flash(f"{restaurant['name']} was already active.", "info")
         return _back_to(restaurant_id)
 
-    unarchive_restaurant(restaurant_id)
+    unarchive_restaurant(restaurant_id, _uid())
     logger.info("Un-archived %s (id=%s)", restaurant["name"], restaurant_id)
 
     message = f"{restaurant['name']} is back on the active list."
@@ -439,7 +602,7 @@ def check_now(restaurant_id: int):
     weekly run would never have made. Neither is reachable from the page
     -- this is for a stale tab or a crafted post.
     """
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         abort(404)
     if not is_checkable(restaurant):
@@ -514,7 +677,7 @@ def delete_confirm(restaurant_id: int):
     """Ask before deleting: a page naming the restaurant, whose button
     POSTs to `delete`. Server-rendered so the guard holds with JavaScript
     off. Read-only -- a GET here never removes anything."""
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         flash("That restaurant had already been removed.", "info")
         return redirect(url_for("index"))
@@ -539,7 +702,7 @@ def delete(restaurant_id: int):
     Always lands on the index -- the detail page it may have been pressed
     from no longer exists -- so there's no `return_to` to honour.
     """
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         # Already gone: a double submit, or a tab left open past the row
         # being deleted elsewhere. Unlike the other routes this doesn't
@@ -548,7 +711,7 @@ def delete(restaurant_id: int):
         flash("That restaurant had already been removed.", "info")
         return redirect(url_for("index"))
 
-    delete_restaurant(restaurant_id)
+    delete_restaurant(restaurant_id, _uid())
     logger.info("Deleted %s (id=%s, place_id=%s) from the dashboard",
                 restaurant["name"], restaurant_id, restaurant["place_id"])
     flash(f"Removed {restaurant['name']} — it won't be checked again.",
@@ -560,11 +723,11 @@ def delete(restaurant_id: int):
 
 def verify(restaurant_id: int):
     """Yes, that's the place. From here on the scheduled run will check it."""
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         abort(404)
 
-    if not verify_restaurant(restaurant_id):
+    if not verify_restaurant(restaurant_id, _uid()):
         # Already verified: a double submit, or a page left open past
         # someone else confirming it. Nothing changed, so don't claim it.
         flash(f"{restaurant['name']} was already verified.", "info")
@@ -597,7 +760,7 @@ def verify_selected():
         flash("Tick at least one restaurant to verify.", "warn")
         return redirect(url_for("index"))
 
-    changed = verify_restaurants(ids)
+    changed = verify_restaurants(ids, _uid())
     logger.info("Bulk-verified %d of %d selected restaurants (ids=%s)",
                 changed, len(ids), sorted(set(ids)))
     if changed:
@@ -617,13 +780,13 @@ def reject(restaurant_id: int):
     That stops a stale tab throwing away a year of history for a place
     confirmed long ago -- archiving is the tool for one that closed.
     """
-    restaurant = get_restaurant(restaurant_id)
+    restaurant = get_restaurant(restaurant_id, _uid())
     if restaurant is None:
         abort(404)
     if restaurant["verified_at"]:
         abort(400, "That restaurant is already verified -- archive it instead.")
 
-    delete_restaurant(restaurant_id)
+    delete_restaurant(restaurant_id, _uid())
     logger.info("Rejected %s (id=%s, place_id=%s) as the wrong place -- deleted",
                 restaurant["name"], restaurant_id, restaurant["place_id"])
     flash(f"Removed {restaurant['name']}. Search again with a street or city "
@@ -685,7 +848,7 @@ def add_search():
         return redirect(url_for("index"))
 
     candidate = place_summary(place, fallback_name=name)
-    existing = get_restaurant_by_place_id(candidate["place_id"])
+    existing = get_restaurant_by_place_id(candidate["place_id"], _uid())
     if existing is not None:
         # Already known. add_restaurant() would quietly ignore the insert,
         # which reads as "added" on a page that then shows one row -- so
@@ -726,7 +889,7 @@ def add_commit():
     # harmless either way; reporting it as a fresh add would not be. The
     # posted id is only ever read from here, never written, so a crafted
     # one can do no more than name a row that's already on the page.
-    existing = get_restaurant_by_place_id(posted_place_id)
+    existing = get_restaurant_by_place_id(posted_place_id, _uid())
     if existing is not None:
         _clear_pending()
         flash(f"{existing['name']} was already being tracked.", "info")
@@ -749,10 +912,10 @@ def add_commit():
     # be the same question about the same two facts.
     add_restaurant(name=candidate["name"], place_id=candidate["place_id"],
                    address=candidate["address"], maps_url=candidate["maps_url"],
-                   verified=True)
+                   verified=True, user_id=_uid())
     _clear_pending()
 
-    added = get_restaurant_by_place_id(candidate["place_id"])
+    added = get_restaurant_by_place_id(candidate["place_id"], _uid())
     if added is None:  # pragma: no cover -- the insert just succeeded
         logger.error("Added %r but couldn't read it back", candidate["place_id"])
         flash("Something went wrong adding that -- check the log.", "warn")
@@ -765,6 +928,10 @@ def add_commit():
 
 
 _URLS: list[tuple[str, Callable, tuple[str, ...]]] = [
+    ("/login", login, ("GET", "POST")),
+    ("/signup", signup, ("GET", "POST")),
+    ("/logout", logout, ("POST",)),
+    ("/settings", settings, ("GET", "POST")),
     ("/", index, ("GET",)),
     ("/restaurant/<int:restaurant_id>", detail, ("GET",)),
     ("/restaurant/<int:restaurant_id>/unarchive", unarchive, ("POST",)),
@@ -786,8 +953,31 @@ def create_app(config: dict | None = None) -> Flask:
     configure_logging()
     app = Flask(__name__)
     app.secret_key = _secret_key()
+    app.config.update(
+        SESSION_COOKIE_SAMESITE="Lax",
+        # Set when it's served over HTTPS (a proxy or tunnel), so the cookie
+        # never travels in the clear.
+        SESSION_COOKIE_SECURE=bool(env_int("DASHBOARD_COOKIE_SECURE", 0)),
+        PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
+    )
+    hops = max(0, env_int("DASHBOARD_PROXY_HOPS", 0))
+    if hops:
+        # Behind that many trusted proxies, the client IP (what the rate limits
+        # key on) and scheme come from X-Forwarded-*. Never set this when the
+        # port is directly reachable: the header would be spoofable.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops)  # type: ignore[method-assign]
+    app.extensions["login_limiter"] = auth.RateLimiter(auth.LOGIN_FAILURES,
+                                                       auth.LOGIN_WINDOW_SECONDS)
+    app.extensions["signup_limiter"] = auth.RateLimiter(auth.SIGNUP_ATTEMPTS,
+                                                        auth.SIGNUP_WINDOW_SECONDS)
+    app.extensions["action_limiter"] = auth.RateLimiter(
+        env_int("DASHBOARD_ACTIONS_PER_MINUTE", DEFAULT_ACTIONS_PER_MINUTE), 60)
     app.jinja_env.globals["csrf_token"] = _csrf_token
+    app.context_processor(lambda: {"auth_enabled": not LOGIN_DISABLED,
+                                    "current_user": g.get("user")})
+    app.before_request(_require_login)
     app.before_request(_require_csrf)
+    app.before_request(_rate_limit_spending)
     app.after_request(_security_headers)
     if config:
         app.config.update(config)
@@ -804,6 +994,34 @@ def create_app(config: dict | None = None) -> Flask:
     return app
 
 
+def _create_user_from_terminal() -> None:
+    """For when sign-up is off (or you'd rather not use the browser)."""
+    import getpass
+    init_db()
+    while True:
+        _, error = auth.create_account(input("Username: "), getpass.getpass("Password: "),
+                                       getpass.getpass("Again: "))
+        if error is None:
+            print("Account created.")
+            return
+        print(error)
+
+
+def serve() -> None:
+    """Run under waitress, a production WSGI server (Flask's dev server isn't
+    meant to face a network). Refuses a non-loopback host while sign-up is open."""
+    host = env_str("DASHBOARD_HOST", DASHBOARD_HOST)
+    port = env_int("DASHBOARD_PORT", DASHBOARD_PORT)
+    init_db()  # the binding check counts accounts, so the table must exist
+    auth.require_safe_binding(host)
+    from waitress import serve as waitress_serve
+    app = create_app()
+    logger.info("Dashboard on http://%s:%s", host, port)
+    waitress_serve(app, host=host, port=port, threads=4)
+
+
 if __name__ == "__main__":
-    # Localhost only: there's no auth here, and the DB holds a personal list.
-    create_app().run(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
+    if sys.argv[1:] == ["create-user"]:
+        _create_user_from_terminal()
+    else:
+        serve()

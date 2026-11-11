@@ -122,3 +122,12 @@ input.text:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px
 .row-note { margin: .5rem 0 0; }
 form.filter { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: 0 0 1rem; }
 .pager { display: flex; gap: 1rem; align-items: center; justify-content: center; padding: .75rem; }
+
+.signout { text-align: right; margin: 0 0 .5rem; }
+
+/* Account forms: one field per row, label above its input. */
+form.add.stack { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: .35rem; }
+form.add.stack label { font-size: .875rem; font-weight: 600; margin-top: .4rem; }
+form.add.stack label:first-of-type { margin-top: 0; }
+form.add.stack input.text { flex: 0 0 auto; width: 100%; box-sizing: border-box; }
+form.add.stack .action { align-self: flex-start; margin-top: .75rem; }

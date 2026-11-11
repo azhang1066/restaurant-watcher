@@ -3,11 +3,13 @@ uses, so this can share a topic/setup if you want one phone feed for both)
 and, optionally, email via SMTP.
 """
 import logging
+import re
 import smtplib
 import ssl
 from email.header import Header
 from email.message import EmailMessage
 
+import db
 from config import DEFAULT_DASHBOARD_URL, env_int, env_str
 from http_session import retrying_session
 from statuses import PHRASES
@@ -29,13 +31,22 @@ NAMES_IN_PUSH = 5
 _session = retrying_session(("POST",))
 
 
-def _ntfy_url() -> str | None:
+def valid_topic(topic: str) -> bool:
+    """Whether `topic` is acceptable as a private ntfy topic: long enough to be
+    unguessable, plain characters, and not one of the shipped placeholders."""
+    return (re.fullmatch(r"[A-Za-z0-9_-]{8,64}", topic) is not None
+            and topic not in _PLACEHOLDER_TOPICS)
+
+
+def _ntfy_url(user_id: int | None = None) -> str | None:
     """The ntfy topic URL, or None when no private topic is configured.
 
-    Read at call time, not import time, so `.env` lands however this module
-    was imported -- see `places_client._api_key()` for the same pattern.
+    The owner's own topic when they've set one in the dashboard, else the
+    NTFY_TOPIC from `.env`. Read at call time, not import time, so `.env` lands
+    however this module was imported -- see `places_client._api_key()` for the
+    same pattern.
     """
-    topic = env_str("NTFY_TOPIC", DEFAULT_NTFY_TOPIC)
+    topic = db.get_ntfy_topic(user_id) or env_str("NTFY_TOPIC", DEFAULT_NTFY_TOPIC)
     if topic in _PLACEHOLDER_TOPICS:
         return None
     return f"https://ntfy.sh/{topic}"
@@ -89,12 +100,13 @@ def _names_summary(names: list[str]) -> str:
 
 
 def notify(title: str, message: str, priority: str = "default",
-           url: str | None = None) -> None:
+           url: str | None = None, user_id: int | None = None) -> None:
     """Send on every configured channel. Raises only if the alert reached
     none of them: a dead ntfy with a working email (or the reverse) is logged,
-    because the message got through."""
+    because the message got through. `user_id` picks that user's own ntfy
+    topic; email is a single address for the whole install."""
     ntfy_error = None
-    ntfy_url = _ntfy_url()
+    ntfy_url = _ntfy_url(user_id)
     if ntfy_url is None:
         # Posting to the placeholder topic would publish restaurant names and
         # addresses to a feed anyone can subscribe to.
@@ -159,6 +171,7 @@ def notify_closed(restaurant: dict, status: str) -> None:
         message=(restaurant.get("address") or "").strip() or "No address on file.",
         priority="high",
         url=restaurant.get("maps_url"),
+        user_id=restaurant.get("user_id"),
     )
 
 
@@ -168,11 +181,14 @@ def notify_closing_soon(restaurant: dict, summary: str) -> None:
         message=summary or "Recent coverage suggests a closure is coming.",
         priority="default",
         url=restaurant.get("maps_url"),
+        user_id=restaurant.get("user_id"),
     )
 
 
 def notify_needs_verification(restaurants: list[dict]) -> None:
-    """One push per run covering everything waiting to be verified.
+    """One push per run covering everything waiting to be verified. The
+    caller passes one user's rows at a time (main groups them), so the push
+    goes to that user's topic.
 
     Deliberately batched rather than one push per restaurant: seeding a file
     of two hundred names would otherwise empty the phone's battery to say a
@@ -188,6 +204,7 @@ def notify_needs_verification(restaurants: list[dict]) -> None:
                 f"dashboard.",
         priority="default",
         url=_dashboard_url(),
+        user_id=restaurants[0].get("user_id") if restaurants else None,
     )
 
 

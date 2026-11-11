@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block title %}Settings &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Settings</h1>
+  <p class="sub"><a href="{{ url_for('index') }}">&larr; Back to your list</a></p>
+  <form class="add stack card" method="post" action="{{ url_for('settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="ntfy_topic">Your ntfy alert topic</label>
+    <input class="text" type="text" id="ntfy_topic" name="ntfy_topic"
+           value="{{ topic }}" maxlength="64" autocomplete="off" spellcheck="false"
+           autocapitalize="none">
+    <p class="muted small">Closure alerts for <em>your</em> restaurants are pushed to
+      this topic. ntfy topics are public &mdash; anyone who knows the name can read
+      the feed &mdash; so make it long and random (8&ndash;64 letters, numbers, dashes
+      or underscores), then subscribe to it in the ntfy app. Leave it empty to use
+      the install's default topic.</p>
+    <button class="action" type="submit">Save</button>
+  </form>
+{% endblock %}

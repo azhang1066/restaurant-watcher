@@ -1641,6 +1641,9 @@ def test_an_empty_search_does_not_use_budget(client, monkeypatch):
 
 def test_a_limit_of_zero_means_no_cap(client, monkeypatch):
     monkeypatch.setenv("DASHBOARD_SEARCHES_PER_DAY", "0")
+    # The per-IP rate limit is a separate layer; this test is about the budget.
+    monkeypatch.setenv("DASHBOARD_ACTIONS_PER_MINUTE", "0")
+    client = dashboard.create_app().test_client()
     calls = _patch_search(monkeypatch)
 
     for _ in range(30):

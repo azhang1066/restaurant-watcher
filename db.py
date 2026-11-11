@@ -25,7 +25,7 @@ _CLOSED_LIST = ", ".join(f"'{s}'" for s in CLOSED_STATUSES)
 _RESTAURANTS_COLUMNS = f"""
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    place_id TEXT UNIQUE NOT NULL,
+    place_id TEXT NOT NULL,
     address TEXT,
     maps_url TEXT,
     added_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -36,7 +36,8 @@ _RESTAURANTS_COLUMNS = f"""
     last_checked_at TEXT,
     archived INTEGER DEFAULT 0 CHECK (archived IN (0, 1)),                     -- 1 once we've notified + user has acknowledged
     verified_at TEXT,                              -- when the user confirmed this place_id is the right location; NULL until then
-    pending_alert TEXT CHECK (pending_alert IN ('closed', 'closing_soon'))  -- an alert recorded with the result but not yet delivered
+    pending_alert TEXT CHECK (pending_alert IN ('closed', 'closing_soon')),  -- an alert recorded with the result but not yet delivered
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE  -- whose list this is; NULL only for rows that predate accounts
 """
 
 _CHECK_LOG_COLUMNS = """
@@ -92,6 +93,15 @@ CREATE TABLE IF NOT EXISTS api_calls (
     kind TEXT NOT NULL,
     called_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Dashboard accounts (see auth.py). Usernames are unique ignoring case.
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    ntfy_topic TEXT,                               -- this user's private alert topic; NULL falls back to NTFY_TOPIC
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Created after migrations rather than in SCHEMA: migrations 2 and 4 drop and
@@ -99,6 +109,11 @@ CREATE TABLE IF NOT EXISTS api_calls (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_api_calls_kind_time ON api_calls (kind, called_at);
 CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
+-- A place is unique per list, not globally: two users can watch the same one.
+-- COALESCE so rows with no owner still dedupe (NULLs are distinct in SQLite).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_restaurants_owner_place
+    ON restaurants (COALESCE(user_id, 0), place_id);
+CREATE INDEX IF NOT EXISTS idx_restaurants_user ON restaurants (user_id);
 CREATE INDEX IF NOT EXISTS idx_check_log_restaurant_time
     ON check_log (restaurant_id, checked_at);
 """
@@ -197,11 +212,34 @@ def _migrate_4_cascade_logs(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE check_log_monthly_new RENAME TO check_log_monthly")
 
 
+def _migrate_5_per_user_lists(conn: sqlite3.Connection) -> None:
+    """Give each restaurant an owner (`user_id`) and let two users watch the same
+    place. Existing rows keep NULL and are adopted by the first account created
+    (see create_user). Row ids are kept, so the log tables still line up."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL,
+        ntfy_topic TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "ntfy_topic" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN ntfy_topic TEXT")
+    names = [row["name"] for row in conn.execute("PRAGMA table_info(restaurants)")
+             if row["name"] != "user_id"]
+    cols = ", ".join(names)
+    conn.execute(f"CREATE TABLE restaurants_new ({_RESTAURANTS_COLUMNS})")
+    conn.execute(f"INSERT INTO restaurants_new ({cols}) SELECT {cols} FROM restaurants")
+    conn.execute("DROP TABLE restaurants")
+    conn.execute("ALTER TABLE restaurants_new RENAME TO restaurants")
+
+
 # Schema version N lives in `PRAGMA user_version`; _MIGRATIONS[N-1] takes a
 # database from version N-1 to N. Append to the list to add one -- each runs
 # once, in order, inside a transaction.
 _MIGRATIONS = [_migrate_1_add_verified_at, _migrate_2_add_constraints,
-               _migrate_3_add_pending_alert, _migrate_4_cascade_logs]
+               _migrate_3_add_pending_alert, _migrate_4_cascade_logs,
+               _migrate_5_per_user_lists]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 
@@ -269,9 +307,18 @@ def init_db() -> None:
         )
 
 
+def _owned(user_id: int | None) -> tuple[str, tuple]:
+    """SQL fragment and params restricting a query to one user's rows. `None`
+    means every row -- the scheduler, seed and tests; the dashboard always
+    passes the signed-in user."""
+    return ("", ()) if user_id is None else (" AND user_id = ?", (user_id,))
+
+
 def add_restaurant(name: str, place_id: str, address: str | None = None,
-                   maps_url: str | None = None, verified: bool = False) -> None:
-    """Insert a restaurant, ignoring the insert if its place_id is already known.
+                   maps_url: str | None = None, verified: bool = False,
+                   user_id: int | None = None) -> None:
+    """Insert a restaurant into `user_id`'s list, ignoring the insert if that
+    list already has its place_id.
 
     `verified` records that the caller already showed the user which place
     this is and got a yes -- what the dashboard's confirm step does. It
@@ -281,33 +328,37 @@ def add_restaurant(name: str, place_id: str, address: str | None = None,
     """
     with get_conn() as conn:
         conn.execute(
-            """INSERT OR IGNORE INTO restaurants (name, place_id, address, maps_url, verified_at)
-               VALUES (?, ?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP END)""",
-            (name, place_id, address, maps_url, int(bool(verified))),
+            """INSERT OR IGNORE INTO restaurants
+                   (name, place_id, address, maps_url, verified_at, user_id)
+               VALUES (?, ?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP END, ?)""",
+            (name, place_id, address, maps_url, int(bool(verified)), user_id),
         )
 
 
-def list_restaurants(active_only: bool = True) -> list[dict]:
+def list_restaurants(active_only: bool = True, user_id: int | None = None) -> list[dict]:
+    where, params = _owned(user_id)
     with get_conn() as conn:
-        q = "SELECT * FROM restaurants"
+        q = "SELECT * FROM restaurants WHERE 1 = 1" + where
         if active_only:
-            q += " WHERE archived = 0"
+            q += " AND archived = 0"
         q += " ORDER BY id"
-        return [dict(r) for r in conn.execute(q).fetchall()]
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
 
 
-def get_restaurant(restaurant_id: int) -> dict | None:
+def get_restaurant(restaurant_id: int, user_id: int | None = None) -> dict | None:
     """One restaurant by id, or None if there's no such row. Same dict shape
     as list_restaurants(), archived or not -- the dashboard links to archived
-    rows too, and they're exactly the ones list_restaurants() hides."""
+    rows too, and they're exactly the ones list_restaurants() hides. With
+    `user_id`, another user's row is None, exactly as if it didn't exist."""
+    where, params = _owned(user_id)
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM restaurants WHERE id = ?", (restaurant_id,)
+            "SELECT * FROM restaurants WHERE id = ?" + where, (restaurant_id, *params)
         ).fetchone()
     return dict(row) if row else None
 
 
-def get_restaurant_by_place_id(place_id: str) -> dict | None:
+def get_restaurant_by_place_id(place_id: str, user_id: int | None = None) -> dict | None:
     """One restaurant by its Google place_id, or None. Same dict shape as
     get_restaurant(), archived rows included.
 
@@ -315,9 +366,10 @@ def get_restaurant_by_place_id(place_id: str) -> dict | None:
     tell "already tracking this place" from "new" -- the INSERT OR IGNORE
     itself reports neither.
     """
+    where, params = _owned(user_id)
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM restaurants WHERE place_id = ?", (place_id,)
+            "SELECT * FROM restaurants WHERE place_id = ?" + where, (place_id, *params)
         ).fetchone()
     return dict(row) if row else None
 
@@ -375,7 +427,7 @@ def list_pending_alerts() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def unarchive_restaurant(restaurant_id: int) -> bool:
+def unarchive_restaurant(restaurant_id: int, user_id: int | None = None) -> bool:
     """Put an archived restaurant back on the active list. Returns True if a
     row changed, False if there's no such restaurant.
 
@@ -391,14 +443,16 @@ def unarchive_restaurant(restaurant_id: int) -> bool:
     that reopened or that Google had wrong, and it sticks once the next check
     confirms that.
     """
+    where, params = _owned(user_id)
     with get_conn() as conn:
         changed = conn.execute(
-            "UPDATE restaurants SET archived = 0 WHERE id = ?", (restaurant_id,)
+            "UPDATE restaurants SET archived = 0 WHERE id = ?" + where,
+            (restaurant_id, *params)
         ).rowcount
     return changed > 0
 
 
-def verify_restaurants(restaurant_ids: Iterable[int]) -> int:
+def verify_restaurants(restaurant_ids: Iterable[int], user_id: int | None = None) -> int:
     """Record that the user confirmed these rows point at the right place, in
     one transaction. Returns how many were newly verified.
 
@@ -409,21 +463,22 @@ def verify_restaurants(restaurant_ids: Iterable[int]) -> int:
     ids = [(i,) for i in restaurant_ids]
     if not ids:
         return 0
+    where, params = _owned(user_id)
     with get_conn() as conn:
         return conn.executemany(
             """UPDATE restaurants SET verified_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND verified_at IS NULL""",
-            ids,
+               WHERE id = ? AND verified_at IS NULL""" + where,
+            [(i, *params) for (i,) in ids],
         ).rowcount
 
 
-def verify_restaurant(restaurant_id: int) -> bool:
+def verify_restaurant(restaurant_id: int, user_id: int | None = None) -> bool:
     """verify_restaurants() for one row: True if it was newly verified, False
     if it was already verified or doesn't exist."""
-    return verify_restaurants([restaurant_id]) > 0
+    return verify_restaurants([restaurant_id], user_id) > 0
 
 
-def delete_restaurant(restaurant_id: int) -> bool:
+def delete_restaurant(restaurant_id: int, user_id: int | None = None) -> bool:
     """Remove a restaurant and everything logged about it (the log tables
     cascade). Returns True if a row went, False if there was no such
     restaurant.
@@ -433,9 +488,10 @@ def delete_restaurant(restaurant_id: int) -> bool:
     other restaurant, so keeping it would put wrong numbers on the page
     forever. Archiving is the tool for a place that really did close.
     """
+    where, params = _owned(user_id)
     with get_conn() as conn:
         removed = conn.execute(
-            "DELETE FROM restaurants WHERE id = ?", (restaurant_id,)
+            "DELETE FROM restaurants WHERE id = ?" + where, (restaurant_id, *params)
         ).rowcount
     return removed > 0
 
@@ -597,6 +653,60 @@ def set_meta(key: str, value) -> None:
 API_CALL_WINDOW_HOURS = 24
 # Rows older than this are dropped on the next spend; only the window matters.
 API_CALL_RETAIN_DAYS = 7
+
+
+def create_user(username: str, password_hash: str) -> int | None:
+    """Add a dashboard account and return its id, or None when the username is
+    taken. The first account ever made adopts every restaurant that has no
+    owner yet -- the list that predates accounts."""
+    with get_conn() as conn:
+        first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        cur = conn.execute("INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)",
+                           (username, password_hash))
+        if cur.rowcount != 1:
+            return None
+        user_id = cur.lastrowid
+        if first:
+            conn.execute("UPDATE restaurants SET user_id = ? WHERE user_id IS NULL", (user_id,))
+        return user_id
+
+
+def get_user_by_name(username: str) -> dict | None:
+    """The account with this username (case-insensitive), password hash included."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users() -> list[dict]:
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, username, ntfy_topic FROM users ORDER BY id").fetchall()]
+
+
+def get_user(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, username, ntfy_topic FROM users WHERE id = ?",
+                           (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_ntfy_topic(user_id: int, topic: str | None) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET ntfy_topic = ? WHERE id = ?", (topic, user_id))
+
+
+def get_ntfy_topic(user_id: int | None) -> str | None:
+    """This user's own alert topic, or None (use the NTFY_TOPIC from `.env`)."""
+    if user_id is None:
+        return None
+    user = get_user(user_id)
+    return user["ntfy_topic"] if user else None
+
+
+def count_users() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
 def spend_budget(kind: str, limit: int) -> bool:

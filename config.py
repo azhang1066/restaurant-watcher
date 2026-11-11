@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 # and the scheduler (its "I was down" push on restart).
 STALE_AFTER_DAYS = 14
 
-# Where the dashboard listens (localhost only: there's no auth, and the DB
-# holds a personal list), and so where a notification should point.
+# Where the dashboard listens by default (loopback only), and so where a
+# notification should point. `DASHBOARD_HOST` / `DASHBOARD_PORT` in `.env`
+# override them at serve time -- and the host only beyond loopback once a
+# password is set (see auth.require_safe_binding).
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 5000
 DEFAULT_DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"

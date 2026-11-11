@@ -18,12 +18,12 @@ select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "checker", "closure_checker", "config", "db", "http_session",
+known-first-party = ["app", "auth", "checker", "closure_checker", "config", "db", "http_session",
                      "main", "notifier", "places_client", "seed", "statuses"]
 
 [tool.mypy]
 python_version = "3.13"
-files = ["app.py", "checker.py", "closure_checker.py", "config.py", "db.py",
+files = ["app.py", "auth.py", "checker.py", "closure_checker.py", "config.py", "db.py",
          "http_session.py", "main.py", "notifier.py", "places_client.py", "seed.py",
          "statuses.py"]
 ignore_missing_imports = true

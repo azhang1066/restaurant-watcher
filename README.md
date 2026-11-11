@@ -52,7 +52,7 @@ Katz's Delicatessen, Manhattan
 ```
 
 ```bash
-python seed.py restaurants.txt
+python seed.py restaurants.txt --user yourname
 ```
 
 Seeding resolves each line through Google Places and takes the first hit, with
@@ -96,10 +96,10 @@ The dashboard also flags anything not checked in 14+ days as **Stale**.
 
 ## Dashboard
 
-A local page over whatever the checks have recorded:
+A page over whatever the checks have recorded:
 
 ```bash
-python app.py           # http://127.0.0.1:5000
+python app.py           # waitress on http://127.0.0.1:5000
 ```
 
 The index lists every tracked restaurant -- closures and closing-soon
@@ -235,7 +235,8 @@ Searching for something already tracked takes you to its row rather than
 adding a duplicate -- including when it's archived, which is how you'd
 rediscover that a place reopened.
 
-`seed.py` is still the way to add a list in bulk.
+`seed.py` is still the way to add a list in bulk (`--user NAME` picks whose list;
+it is optional while there is at most one account).
 
 ### Re-activating an archived restaurant
 
@@ -255,8 +256,49 @@ generated once and kept in `data/.dashboard_secret`, so an open page survives
 a restart (delete the file to rotate it). Pages load no inline script or style, and
 send a Content-Security-Policy saying so.
 
-It binds to localhost and has no auth or login, so don't expose it to a
-network -- more so now that buttons on it add rows and spend API calls.
+### Reaching it from a phone
+
+Every page needs a login, even on localhost. Accounts are stored on the server
+(the password hashed, in the database), so one account works from your computer,
+your phone and anything else that reaches it. **Create one from the login page's
+"Create an account" link** (username of 3-32 letters, numbers, `.`, `-`, `_`;
+password of 8+ characters), or with `python app.py create-user`.
+
+**Every account has its own list.** A restaurant belongs to the account that added
+it, and nobody sees, checks, verifies or deletes another's -- the same place can be
+on several lists. The list that existed before accounts was adopted by the first
+account created. Closure alerts go to that account's own ntfy topic, set under
+**Settings** (top of every page); an account with no topic of its own uses
+`NTFY_TOPIC` from `.env`, as does email (one `EMAIL_TO` for the whole install).
+The things that spend money are shared: the daily Search / Check-now budgets and
+the Places / Anthropic bills are the install's, not per account, and a place two
+people watch is checked once for each of them.
+
+Anyone who can create an account can press the buttons that spend money, so
+sign-up is gated before the server is reachable from anywhere else:
+
+- `DASHBOARD_SIGNUP_CODE` -- sign-up asks for this code. **`python app.py` refuses
+  a `DASHBOARD_HOST` beyond loopback unless a code is set** (or sign-up is off).
+- `DASHBOARD_SIGNUP=off` -- hides sign-up entirely, once the accounts you want
+  exist. Beyond loopback it also refuses to start with no account to sign in with.
+- With neither, sign-up is open: fine on localhost only.
+
+1. Create your account on localhost first.
+2. Set `DASHBOARD_SIGNUP_CODE`, `DASHBOARD_HOST` (e.g. `0.0.0.0`) and
+   `DASHBOARD_PORT` if needed; share the code only with people you trust.
+3. Put it behind HTTPS -- a reverse proxy or a tunnel such as Tailscale Serve or
+   Cloudflare Tunnel. Passwords and the session cookie are otherwise sent in the
+   clear. Set `DASHBOARD_COOKIE_SECURE=1`, and `DASHBOARD_PROXY_HOPS=1` (the
+   number of trusted proxies) so the per-IP limits see the real client address.
+   Leave `DASHBOARD_PROXY_HOPS` at 0 if the port is directly reachable.
+
+Signed-in sessions last 30 days; there's a Sign out button. Five failed logins
+from one IP lock that IP out for 15 minutes, and sign-up allows 10 attempts an hour per IP. Search and Check now are also
+limited per IP (`DASHBOARD_ACTIONS_PER_MINUTE`, default 10) in front of the daily
+budgets. These counters live in memory and reset on a restart; the daily budgets
+are in the database. `python app.py` runs waitress; `flask --app app run` is
+the dev server, for localhost only.
+
 Checks themselves still run from `main.py`.
 
 ## How checking works
@@ -329,6 +371,5 @@ down. A `businessStatus` value Google adds in future is stored as
   it -- **Check now** is deliberately the Places half only, so no button on the
   page can run up a Claude bill.
 - Two dashboard buttons do spend, both in the cheap tier and both once per
-  press, with no rate limit in front of them: **Search** (one Text Search) and
-  **Check now** (one `businessStatus` call). Fine for one person clicking on
-  localhost; it's the first thing to revisit if the dashboard is ever exposed.
+  press: **Search** (one Text Search) and **Check now** (one `businessStatus`
+  call). Both sit behind the login, a per-IP rate limit and the daily budgets.

@@ -232,12 +232,15 @@ def _run_check(include_news_check: bool | None) -> None:
                              "restaurant(s) unchecked", consecutive, remaining)
                 break
 
-    if unverified:
-        # One push for the whole batch, after the checks so a run with real
-        # news leads with it. Isolated like the housekeeping below: a dead
-        # ntfy must not lose the check results already written.
+    # One push per user for their batch, after the checks so a run with real
+    # news leads with it. Isolated like the housekeeping below: a dead ntfy
+    # must not lose the check results already written.
+    by_user: dict[int | None, list[dict]] = {}
+    for r in unverified:
+        by_user.setdefault(r.get("user_id"), []).append(r)
+    for batch in by_user.values():
         try:
-            notify_needs_verification(unverified)
+            notify_needs_verification(batch)
         except Exception:
             logger.exception("Couldn't send the needs-verifying notification -- continuing")
 
