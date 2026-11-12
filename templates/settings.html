@@ -18,4 +18,57 @@
       the install's default topic.</p>
     <button class="action" type="submit">Save</button>
   </form>
+
+  <h2>Email</h2>
+  <form class="add stack card" method="post" action="{{ url_for('change_email') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="email">Email address</label>
+    <input class="text" type="email" id="email" name="email" value="{{ pending_email or email }}"
+           required maxlength="254" autocomplete="email" autocapitalize="none" spellcheck="false">
+    <label for="email_current">Current password</label>
+    <input class="text" type="password" id="email_current" name="current" required
+           autocomplete="current-password">
+    <p class="muted small">
+      {% if email and email_confirmed %}Confirmed: {{ email }}.{% elif email %}{{ email }} isn't confirmed yet.{% endif %}
+      {% if pending_email %}A confirmation link is out for {{ pending_email }}; your email
+      changes when it's opened.{% endif %}
+      This is where a password-reset link is sent. A new address only replaces the
+      current one once you open the link we email to it.
+      {% if not can_reset %}This server can't send email yet, so confirming isn't
+      possible until SMTP is configured.{% endif %}</p>
+    <button class="action" type="submit">Send confirmation link</button>
+  </form>
+
+  <h2>Change password</h2>
+  <form class="add stack card" method="post" action="{{ url_for('change_password') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="current">Current password</label>
+    <input class="text" type="password" id="current" name="current" required
+           autocomplete="current-password">
+    <label for="new_password">New password</label>
+    <input class="text" type="password" id="new_password" name="password" required
+           minlength="{{ min_password }}" autocomplete="new-password">
+    <label for="new_confirm">New password again</label>
+    <input class="text" type="password" id="new_confirm" name="confirm" required
+           minlength="{{ min_password }}" autocomplete="new-password">
+    <p class="muted small">At least {{ min_password }} characters. Your other devices
+      will be signed out. Forgotten it? Sign out and use "Forgot your password?" on the
+      sign-in page, or ask whoever runs the server to run
+      <code>python app.py reset-password</code>.</p>
+    <button class="action" type="submit">Change password</button>
+  </form>
+
+  <h2>Delete account</h2>
+  <form class="add stack card" method="post" action="{{ url_for('delete_account') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <p class="muted small">This removes your account, your restaurant list and all its
+      check history. It can't be undone.</p>
+    <label for="del_username">Type your username ({{ current_user.username }})</label>
+    <input class="text" type="text" id="del_username" name="username" required
+           autocomplete="off" autocapitalize="none" spellcheck="false">
+    <label for="del_current">Current password</label>
+    <input class="text" type="password" id="del_current" name="current" required
+           autocomplete="current-password">
+    <button class="action" type="submit">Delete my account</button>
+  </form>
 {% endblock %}

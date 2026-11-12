@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block title %}New password &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Choose a new password</h1>
+  <form class="add stack card" method="post" action="{{ url_for('reset_with_link', token=request.view_args.token) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="password">New password ({{ min_password }}+ characters)</label>
+    <input class="text" type="password" id="password" name="password" required
+           minlength="{{ min_password }}" autocomplete="new-password" autofocus>
+    <label for="confirm">Confirm password</label>
+    <input class="text" type="password" id="confirm" name="confirm" required
+           minlength="{{ min_password }}" autocomplete="new-password">
+    <button class="action" type="submit">Set password</button>
+  </form>
+{% endblock %}

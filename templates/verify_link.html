@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block title %}Confirm email &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Confirm this email?</h1>
+  <form class="add stack card" method="post"
+        action="{{ url_for('verify_link', token=request.view_args.token) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <p>Use <strong>{{ email }}</strong> for your Restaurant Watcher account.</p>
+    <button class="action" type="submit">Confirm</button>
+  </form>
+{% endblock %}

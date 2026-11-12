@@ -57,14 +57,15 @@ def _dashboard_url() -> str:
     return env_str("DASHBOARD_URL", DEFAULT_DASHBOARD_URL)
 
 
-def _email_settings() -> dict | None:
+def _email_settings(need_to: bool = True) -> dict | None:
     """SMTP config, or None when email isn't configured (host/from/to are the
-    required trio)."""
+    required trio; `need_to=False` drops the install-wide recipient, for mail
+    that goes to one person)."""
     user = env_str("SMTP_USER")
     host = env_str("SMTP_HOST")
     sender = env_str("EMAIL_FROM") or user
     to = env_str("EMAIL_TO")
-    if not (host and sender and to):
+    if not (host and sender and (to or not need_to)):
         return None
     return {
         "host": host,
@@ -72,8 +73,13 @@ def _email_settings() -> dict | None:
         "user": user,
         "password": env_str("SMTP_PASSWORD"),
         "sender": sender,
-        "to": to,
+        "to": to or "",
     }
+
+
+def email_configured() -> bool:
+    """Whether this install can send email to an arbitrary address."""
+    return _email_settings(need_to=False) is not None
 
 
 def _header_value(value: str) -> str:
@@ -129,18 +135,19 @@ def notify(title: str, message: str, priority: str = "default",
         raise ntfy_error
 
 
-def _send_email(subject: str, message: str, url: str | None = None) -> bool:
+def _send_email(subject: str, message: str, url: str | None = None,
+                to: str | None = None) -> bool:
     """Best effort. True if the email went out, False if it didn't or isn't
-    configured."""
+    configured. `to` overrides the install's EMAIL_TO."""
     try:
-        cfg = _email_settings()
+        cfg = _email_settings(need_to=to is None)
         if cfg is None:
             return False
         body = f"{message}\n\n{url}" if url else message
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = cfg["sender"]
-        msg["To"] = cfg["to"]
+        msg["To"] = to or cfg["to"]
         msg.set_content(body)
         # An explicit context: smtplib's default for starttls() doesn't verify
         # the server's certificate, which would hand the password to anyone
@@ -161,6 +168,29 @@ def _send_email(subject: str, message: str, url: str | None = None) -> bool:
     except Exception:
         logger.exception("Email notification failed")
         return False
+
+
+def send_password_reset(email: str, username: str, token: str) -> bool:
+    """Mail a reset link. It points at DASHBOARD_URL, never at the request's own
+    Host header, which a stranger could set to make the link lead to their site."""
+    link = f"{_dashboard_url().rstrip('/')}/reset/{token}"
+    return _send_email(
+        "Reset your Restaurant Watcher password",
+        f"Someone asked to reset the password for {username}. The link below works "
+        f"once and expires in {db.RESET_TTL_MINUTES} minutes. If it wasn't you, "
+        "ignore this email and nothing changes.",
+        url=link, to=email)
+
+
+def send_email_verification(email: str, username: str, token: str) -> bool:
+    """Mail a confirmation link (built from DASHBOARD_URL; see send_password_reset)."""
+    link = f"{_dashboard_url().rstrip('/')}/verify/{token}"
+    return _send_email(
+        "Confirm your email for Restaurant Watcher",
+        f"Confirm this address for the account {username}. The link works once and "
+        f"expires in {db.VERIFY_TTL_HOURS} hours. If you didn't ask for it, ignore "
+        "this email and nothing changes.",
+        url=link, to=email)
 
 
 def notify_closed(restaurant: dict, status: str) -> None:

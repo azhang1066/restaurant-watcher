@@ -17,6 +17,9 @@
            autocomplete="current-password">
     <button class="action" type="submit">Sign in</button>
   </form>
+  {% if can_reset %}
+    <p class="small mt-m"><a href="{{ url_for('forgot_password') }}">Forgot your password?</a></p>
+  {% endif %}
   {% if signup_open %}
     <p class="small mt-m">New here? <a href="{{ url_for('signup') }}">Create an account</a></p>
   {% endif %}

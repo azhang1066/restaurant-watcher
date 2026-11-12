@@ -100,7 +100,27 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     ntfy_topic TEXT,                               -- this user's private alert topic; NULL falls back to NTFY_TOPIC
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    email TEXT,                                    -- where reset links go; only ever set by confirming a link
+    email_verified_at TEXT                         -- NULL until the address has been confirmed
+);
+
+-- A confirmation link waiting to be clicked: this address, for this account. The
+-- address lives here, not on the user, until the link proves it is reachable.
+-- Only the SHA-256 of the token is kept.
+CREATE TABLE IF NOT EXISTS email_verifications (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+-- Outstanding password-reset links. Only the SHA-256 of the token is kept, so a
+-- copy of the database can't be used to take an account over.
+CREATE TABLE IF NOT EXISTS password_resets (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL
 );
 """
 
@@ -114,6 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_restaurants_archived ON restaurants (archived);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_restaurants_owner_place
     ON restaurants (COALESCE(user_id, 0), place_id);
 CREATE INDEX IF NOT EXISTS idx_restaurants_user ON restaurants (user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email COLLATE NOCASE)
+    WHERE email IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_check_log_restaurant_time
     ON check_log (restaurant_id, checked_at);
 """
@@ -234,12 +256,28 @@ def _migrate_5_per_user_lists(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE restaurants_new RENAME TO restaurants")
 
 
+def _migrate_6_user_email(conn: sqlite3.Connection) -> None:
+    """Give accounts an optional email address, for password-reset links."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "email" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+
+
+def _migrate_7_email_verified(conn: sqlite3.Connection) -> None:
+    """Track whether an account's email has been confirmed. Addresses entered
+    before this existed stay on the account but unconfirmed."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "email_verified_at" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN email_verified_at TEXT")
+
+
 # Schema version N lives in `PRAGMA user_version`; _MIGRATIONS[N-1] takes a
 # database from version N-1 to N. Append to the list to add one -- each runs
 # once, in order, inside a transaction.
 _MIGRATIONS = [_migrate_1_add_verified_at, _migrate_2_add_constraints,
                _migrate_3_add_pending_alert, _migrate_4_cascade_logs,
-               _migrate_5_per_user_lists]
+               _migrate_5_per_user_lists, _migrate_6_user_email,
+               _migrate_7_email_verified]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 
@@ -655,14 +693,20 @@ API_CALL_WINDOW_HOURS = 24
 API_CALL_RETAIN_DAYS = 7
 
 
-def create_user(username: str, password_hash: str) -> int | None:
+def create_user(username: str, password_hash: str, email: str | None = None,
+                verified: bool = False) -> int | None:
     """Add a dashboard account and return its id, or None when the username is
     taken. The first account ever made adopts every restaurant that has no
     owner yet -- the list that predates accounts."""
     with get_conn() as conn:
         first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
-        cur = conn.execute("INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)",
-                           (username, password_hash))
+        try:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO users (username, password_hash, email, email_verified_at)
+                   VALUES (?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP END)""",
+                (username, password_hash, email, int(bool(verified and email))))
+        except sqlite3.IntegrityError:  # the email is already on another account
+            return None
         if cur.rowcount != 1:
             return None
         user_id = cur.lastrowid
@@ -681,14 +725,141 @@ def get_user_by_name(username: str) -> dict | None:
 def list_users() -> list[dict]:
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT id, username, ntfy_topic FROM users ORDER BY id").fetchall()]
+            "SELECT id, username, ntfy_topic, email, email_verified_at FROM users ORDER BY id").fetchall()]
 
 
 def get_user(user_id: int) -> dict | None:
+    """The account with this id, password hash included (app.py strips it before
+    the user reaches a template)."""
     with get_conn() as conn:
-        row = conn.execute("SELECT id, username, ntfy_topic FROM users WHERE id = ?",
+        row = conn.execute("SELECT id, username, ntfy_topic, email, email_verified_at, password_hash "
+            "FROM users WHERE id = ?",
                            (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+def set_password_hash(user_id: int, password_hash: str) -> bool:
+    """Store a new password. Any reset link still outstanding for the account is
+    voided, so a link mailed before a password change can't undo it."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user_id,))
+        return conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                            (password_hash, user_id)).rowcount > 0
+
+
+def set_email(user_id: int, email: str | None) -> bool:
+    """Set the account's email as confirmed (or clear it, with None). For the
+    terminal and tests: the dashboard goes through confirm_email(). False if
+    another account already has it."""
+    with get_conn() as conn:
+        try:
+            conn.execute("UPDATE users SET email = ?, email_verified_at = "
+                         "CASE WHEN ? IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END "
+                         "WHERE id = ?", (email, email, user_id))
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+VERIFY_TTL_HOURS = 24
+
+
+def create_verification(token_hash: str, user_id: int, email: str) -> None:
+    """Record a confirmation link for this address, replacing the account's
+    earlier one, and drop expired ones."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM email_verifications WHERE expires_at <= datetime('now') "
+                     "OR user_id = ?", (user_id,))
+        conn.execute("INSERT INTO email_verifications (token_hash, user_id, email, expires_at) "
+                     "VALUES (?, ?, ?, datetime('now', ?))",
+                     (token_hash, user_id, email, f"+{VERIFY_TTL_HOURS} hours"))
+
+
+def peek_verification(token_hash: str) -> dict | None:
+    """The account and address a live confirmation link is for, unused."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT user_id, email FROM email_verifications "
+                           "WHERE token_hash = ? AND expires_at > datetime('now')",
+                           (token_hash,)).fetchone()
+    return dict(row) if row else None
+
+
+def pending_verification_email(user_id: int) -> str | None:
+    """The address this account has a live confirmation link out for, if any."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT email FROM email_verifications WHERE user_id = ? "
+                           "AND expires_at > datetime('now')", (user_id,)).fetchone()
+    return row["email"] if row else None
+
+
+def confirm_email(token_hash: str) -> str:
+    """Use a confirmation link up and make its address the account's confirmed
+    one. 'ok', 'invalid' (unknown, expired or already used) or 'taken' (another
+    account confirmed the same address first). One write-locked transaction, so
+    a link can't be spent twice."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT user_id, email FROM email_verifications "
+                           "WHERE token_hash = ? AND expires_at > datetime('now')",
+                           (token_hash,)).fetchone()
+        if row is None:
+            return "invalid"
+        conn.execute("DELETE FROM email_verifications WHERE token_hash = ?", (token_hash,))
+        try:
+            conn.execute("UPDATE users SET email = ?, email_verified_at = CURRENT_TIMESTAMP "
+                         "WHERE id = ?", (row["email"], row["user_id"]))
+        except sqlite3.IntegrityError:
+            return "taken"
+    return "ok"
+
+
+def get_user_by_email(email: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    return dict(row) if row else None
+
+
+RESET_TTL_MINUTES = 60
+
+
+def create_reset(token_hash: str, user_id: int) -> None:
+    """Record a reset link for the account, replacing any earlier one, and drop
+    expired ones."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM password_resets WHERE expires_at <= datetime('now') "
+                     "OR user_id = ?", (user_id,))
+        conn.execute("INSERT INTO password_resets (token_hash, user_id, expires_at) "
+                     "VALUES (?, ?, datetime('now', ?))",
+                     (token_hash, user_id, f"+{RESET_TTL_MINUTES} minutes"))
+
+
+def peek_reset(token_hash: str) -> int | None:
+    """The account a live reset link belongs to, without using it up."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT user_id FROM password_resets WHERE token_hash = ? "
+                           "AND expires_at > datetime('now')", (token_hash,)).fetchone()
+    return row["user_id"] if row else None
+
+
+def consume_reset(token_hash: str) -> int | None:
+    """Use a reset link up: its account id, or None if unknown, expired or used.
+    One write-locked transaction, so a link can't be spent twice."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT user_id FROM password_resets WHERE token_hash = ? "
+                           "AND expires_at > datetime('now')", (token_hash,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM password_resets WHERE token_hash = ?", (token_hash,))
+    return row["user_id"]
+
+
+def delete_user(user_id: int) -> bool:
+    """Remove an account and its whole list: restaurants, and through them their
+    check history. Returns False if there was no such account."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM restaurants WHERE user_id = ?", (user_id,))
+        return conn.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount > 0
 
 
 def set_ntfy_topic(user_id: int, topic: str | None) -> None:

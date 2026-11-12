@@ -286,11 +286,40 @@ sign-up is gated before the server is reachable from anywhere else:
 1. Create your account on localhost first.
 2. Set `DASHBOARD_SIGNUP_CODE`, `DASHBOARD_HOST` (e.g. `0.0.0.0`) and
    `DASHBOARD_PORT` if needed; share the code only with people you trust.
-3. Put it behind HTTPS -- a reverse proxy or a tunnel such as Tailscale Serve or
-   Cloudflare Tunnel. Passwords and the session cookie are otherwise sent in the
-   clear. Set `DASHBOARD_COOKIE_SECURE=1`, and `DASHBOARD_PROXY_HOPS=1` (the
-   number of trusted proxies) so the per-IP limits see the real client address.
-   Leave `DASHBOARD_PROXY_HOPS` at 0 if the port is directly reachable.
+3. Serve it over HTTPS; passwords and the session cookie are otherwise sent in the
+   clear (the server logs a warning when it listens beyond loopback without it).
+   Either:
+   - set `DASHBOARD_TLS_CERT` and `DASHBOARD_TLS_KEY` to PEM files and
+     `python app.py` serves HTTPS itself (via cheroot; waitress can't do TLS), with
+     the cookie marked Secure and an HSTS header; or
+   - put a reverse proxy or tunnel (Tailscale Serve, Cloudflare Tunnel) in front.
+     Set `DASHBOARD_COOKIE_SECURE=1`, and `DASHBOARD_PROXY_HOPS=1` (the number of
+     trusted proxies) so the per-IP limits see the real client address. Leave
+     `DASHBOARD_PROXY_HOPS` at 0 if the port is directly reachable.
+
+**Passwords and accounts.** Under **Settings** you can change your password (the
+current one is required, and your other devices are signed out), set an email
+address, or delete your account, which removes its restaurant list and history too.
+
+**Every account needs a confirmed email.** Sign-up asks for one and emails a link;
+the account is signed in but can't do anything until that link is opened and
+Confirm pressed (the link works once and lasts 24 hours; the page lets you resend
+it or correct the address). A new address only replaces the old one when its link
+is used, whether at sign-up or under **Settings** (which also asks for your
+password). Because mail must go out for any of this to work, **sign-up is refused
+while SMTP isn't configured** (`SMTP_HOST` and `EMAIL_FROM`, see above); create
+accounts with `python app.py create-user`, which asks for an email and counts it as
+confirmed since you typed it at the server. Accounts that predate this are asked to
+confirm (or add) an email the next time they sign in, once SMTP is configured; until
+then they aren't gated, since nobody could confirm.
+
+*Forgotten password:* the sign-in page's **Forgot your password?** emails a link
+to the account's confirmed address; it works once and expires in an hour. Set
+`DASHBOARD_URL` to the address people reach the dashboard at, because both kinds of
+link are built from it (never from the request, which a stranger could forge). The
+reply is the same whether or not an account matched, and requests are limited to 5
+an hour per IP. If you can't get the email, whoever runs the server resets it with
+`python app.py reset-password`.
 
 Signed-in sessions last 30 days; there's a Sign out button. Five failed logins
 from one IP lock that IP out for 15 minutes, and sign-up allows 10 attempts an hour per IP. Search and Check now are also

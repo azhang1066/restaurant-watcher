@@ -16,7 +16,8 @@ def _isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "LOGIN_DISABLED", True)
     for name in ("DASHBOARD_PASSWORD", "DASHBOARD_PASSWORD_HASH", "DASHBOARD_USERNAME",
                  "DASHBOARD_SIGNUP", "DASHBOARD_SIGNUP_CODE", "DASHBOARD_PROXY_HOPS",
-                 "DASHBOARD_COOKIE_SECURE", "DASHBOARD_ACTIONS_PER_MINUTE"):
+                 "DASHBOARD_COOKIE_SECURE", "DASHBOARD_ACTIONS_PER_MINUTE",
+                 "DASHBOARD_TLS_CERT", "DASHBOARD_TLS_KEY"):
         monkeypatch.delenv(name, raising=False)
     # create_app()/configure_logging() must not drop a log file into data/.
     monkeypatch.setenv("LOG_FILE", "off")

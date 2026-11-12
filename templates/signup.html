@@ -17,6 +17,11 @@
     <label for="confirm">Confirm password</label>
     <input class="text" type="password" id="confirm" name="confirm" required
            minlength="{{ min_password }}" autocomplete="new-password">
+    <label for="email">Email</label>
+    <input class="text" type="email" id="email" name="email" required maxlength="254"
+           autocomplete="email" autocapitalize="none" spellcheck="false">
+    <p class="muted small">We'll email a link to confirm it. It's also where a
+      password-reset link goes.</p>
     {% if needs_code %}
       <label for="code">Sign-up code</label>
       <input class="text" type="password" id="code" name="code" required

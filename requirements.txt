@@ -5,3 +5,4 @@ python-dotenv==1.2.3
 apscheduler==3.11.3
 anthropic==1.6.0
 waitress==3.0.2
+cheroot==11.1.2

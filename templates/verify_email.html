@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+
+{% block title %}Confirm your email &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Confirm your email</h1>
+  {% if email %}
+    <p class="sub">We sent a link to <strong>{{ email }}</strong>. Open it and press
+      Confirm to start using your account. It's valid for 24 hours.</p>
+  {% else %}
+    <p class="sub">Your account needs an email address. Enter one and we'll send a
+      link to confirm it.</p>
+  {% endif %}
+  <form class="add stack card" method="post" action="{{ url_for('verify_email') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="email">Email address</label>
+    <input class="text" type="email" id="email" name="email" value="{{ email }}" required
+           maxlength="254" autocomplete="email" autocapitalize="none" spellcheck="false">
+    <button class="action" type="submit">{% if email %}Send the link again{% else %}Send a link{% endif %}</button>
+    <p class="muted small">Wrong address? Change it above and send again.</p>
+  </form>
+{% endblock %}

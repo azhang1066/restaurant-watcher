@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}Forgot password &mdash; Restaurant Watcher{% endblock %}
+
+{% block content %}
+  <h1>Forgot your password?</h1>
+  <p class="sub">Enter your username or the email address on your account and we'll
+    send a link to choose a new password.</p>
+  <form class="add stack card" method="post" action="{{ url_for('forgot_password') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="identifier">Username or email</label>
+    <input class="text" type="text" id="identifier" name="identifier" required
+           autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+    <button class="action" type="submit">Send reset link</button>
+  </form>
+  <p class="muted small mt-m">Links go to a confirmed email address. If yours isn't, ask whoever runs the server to run <code>python app.py reset-password</code>.</p>
+  <p class="small mt-m"><a href="{{ url_for('login') }}">Back to sign in</a></p>
+{% endblock %}

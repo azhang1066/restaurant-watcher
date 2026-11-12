@@ -48,6 +48,14 @@ restaurant belongs to one account and every query here is scoped to the signed-i
 one (`_uid()`), so nobody sees or changes another's list. Alerts go to that
 account's own ntfy topic (/settings). Search and Check now also carry a per-IP rate limit
 (`DASHBOARD_ACTIONS_PER_MINUTE`) in front of the daily budgets. See auth.py.
+/settings also changes the password (other devices' sessions end: the session
+carries a stamp of the password hash), sets the account's email and deletes the
+account with its list. Every account needs a confirmed email: sign-up mails a link
+(/verify/<token>, confirmed by a POST so mail scanners can't spend it) and the
+account is held at /verify-email until it's used -- but only while SMTP is
+configured, since otherwise nobody could ever confirm. A forgotten password is
+reset by emailed link (/forgot, /reset/<token>) to that address, or from the terminal.
+HTTPS: set DASHBOARD_TLS_CERT/KEY to have `python app.py` serve it (cheroot).
 
 Every POST is CSRF-checked in one `before_request` hook -- see `_require_csrf`
 -- against a token tied to the session. That needs a signing key, so set
@@ -62,6 +70,7 @@ There's deliberately no module-level `app`: Flask's loader finds the
 Run it:
     python app.py                  # waitress on DASHBOARD_HOST:DASHBOARD_PORT
     python app.py create-user       # make an account from the terminal
+    python app.py reset-password    # set a new password for a forgotten one
     flask --app app run            # dev server, localhost only
 """
 import hmac
@@ -69,6 +78,7 @@ import logging
 import math
 import secrets
 import sys
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -113,7 +123,7 @@ from db import (
     verify_restaurant,
     verify_restaurants,
 )
-from notifier import valid_topic
+from notifier import email_configured, send_email_verification, send_password_reset, valid_topic
 from places_client import PlaceNotFound, find_place_id, place_summary
 from statuses import CLOSED_PERMANENTLY, CLOSED_STATUSES, CLOSED_TEMPORARILY, LABELS, OPERATIONAL
 
@@ -234,6 +244,10 @@ def _client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
+# What a signed-in account with an unconfirmed email can still reach.
+_UNCONFIRMED_OK = frozenset({"verify_email", "verify_link", "logout", "static"})
+
+
 def _require_login():
     """Send anyone without a signed-in session to the login page.
 
@@ -246,16 +260,32 @@ def _require_login():
     user = _session_user()
     if user is not None:
         g.user = user
+        # An account must confirm its email before it can be used. Skipped when
+        # the server can't send mail: nobody could ever confirm, so gating would
+        # just lock everyone out.
+        if (not user["email_verified_at"] and request.endpoint not in _UNCONFIRMED_OK
+                and email_configured()):
+            return redirect(url_for("verify_email"))
         return None
-    if request.endpoint in ("login", "signup", "static"):
+    if request.endpoint in ("login", "signup", "forgot_password", "reset_with_link",
+                            "verify_link", "static"):
         return None
     session.pop("user_id", None)
     return redirect(url_for("login"))
 
 
 def _session_user() -> dict | None:
+    """The signed-in account, or None. The session must also carry the stamp of
+    the account's current password, so changing or resetting it ends every other
+    device's session."""
     user_id = session.get("user_id")
-    return db.get_user(user_id) if isinstance(user_id, int) else None
+    user = db.get_user(user_id) if isinstance(user_id, int) else None
+    if user is None:
+        return None
+    stamp = auth.session_stamp(user.pop("password_hash"))
+    if not hmac.compare_digest(str(session.get("pw", "")), stamp):
+        return None
+    return user
 
 
 def _uid() -> int | None:
@@ -268,8 +298,12 @@ def _uid() -> int | None:
 def _sign_in(user_id: int) -> None:
     # A fresh session on privilege change: nothing minted before login (the
     # CSRF token included) carries over.
+    user = db.get_user(user_id)
     session.clear()
+    if user is None:  # deleted in the instant since it was made; stay signed out
+        return
     session["user_id"] = user_id
+    session["pw"] = auth.session_stamp(user["password_hash"])
     session.permanent = True
 
 
@@ -286,6 +320,8 @@ def _security_headers(response: Response) -> Response:
     response.headers.setdefault("Content-Security-Policy", _CSP)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "same-origin")
+    if request.is_secure:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return response
 
 
@@ -434,7 +470,8 @@ def login():
         flash("Wrong username or password.", "warn")
         return redirect(url_for("login"))
     return render_template("login.html", has_login=auth.has_login(),
-                           signup_open=auth.signup_mode() != "closed")
+                           signup_open=auth.signup_mode() != "closed",
+                           can_reset=email_configured())
 
 
 def signup():
@@ -446,6 +483,12 @@ def signup():
         return redirect(url_for("index"))
     if request.method == "POST":
         ip = _client_ip()
+        if not email_configured():
+            # An account needs a confirmed email, and confirming needs mail out.
+            flash("Sign-up needs this server to be able to send email, and it can't yet. "
+                  "Ask whoever runs it to create your account with "
+                  "`python app.py create-user`.", "warn")
+            return redirect(url_for("login"))
         if not current_app.extensions["signup_limiter"].hit(ip):
             logger.warning("Sign-up throttled for %s", ip)
             abort(429, "Too many sign-up attempts -- try again later.")
@@ -455,15 +498,128 @@ def signup():
             return redirect(url_for("signup"))
         user_id, error = auth.create_account(request.form.get("username", ""),
                                              request.form.get("password", ""),
-                                             request.form.get("confirm", ""))
+                                             request.form.get("confirm", ""),
+                                             request.form.get("email", ""))
         if user_id is None:
             flash(error or "Couldn't create the account.", "warn")
             return redirect(url_for("signup"))
         logger.info("New account %r from %s", request.form.get("username", "").strip(), ip)
+        _send_verification(user_id, request.form.get("email", ""))
         _sign_in(user_id)
-        return redirect(url_for("index"))
+        return redirect(url_for("verify_email"))
     return render_template("signup.html", needs_code=mode == "code",
-                           min_password=auth.MIN_PASSWORD_CHARS)
+                           min_password=auth.MIN_PASSWORD_CHARS,
+                           can_reset=email_configured())
+
+
+def _send_verification(user_id: int, raw_email: str) -> str | None:
+    """Start confirming an address for this account and mail the link in the
+    background. Returns a message for the person if it couldn't be started."""
+    address, token, error = auth.start_verification(user_id, raw_email)
+    if error is None:
+        _mail_verification(user_id, address, token)
+    return error
+
+
+def _mail_verification(user_id: int, address: str | None, token: str | None) -> None:
+    user = db.get_user(user_id)
+    if user and address and token:
+        _dispatch(send_email_verification, address, user["username"], token)
+
+
+def verify_email():
+    """Where an account with an unconfirmed email lands: says where the link went,
+    and lets the person resend it or give a different address. No password is
+    asked for -- the account can't do anything yet, and a new address only counts
+    once its link is used."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    if g.user["email_verified_at"] or not email_configured():
+        return redirect(url_for("index"))
+    pending = db.pending_verification_email(g.user["id"]) or g.user["email"] or ""
+    if request.method == "POST":
+        if not current_app.extensions["verify_limiter"].hit(_client_ip()):
+            abort(429, "Too many confirmation emails -- try again later.")
+        error = _send_verification(g.user["id"], request.form.get("email", pending))
+        flash(error or "Sent. Open the link in it to finish.", "warn" if error else "info")
+        return redirect(url_for("verify_email"))
+    return render_template("verify_email.html", email=pending)
+
+
+def verify_link(token: str):
+    """The page a confirmation email links to. Confirming is a POST behind a
+    button, not the GET itself: mail scanners and link previews open every link
+    in a message, and would otherwise spend it."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        result = auth.confirm_email(token)
+        if result == "ok":
+            flash("Email confirmed.", "info")
+        elif result == "taken":
+            flash("Another account confirmed that address first.", "warn")
+        else:
+            flash("That confirmation link has expired or was already used.", "warn")
+        return redirect(url_for("index" if "user" in g else "login"))
+    pending = auth.verification_pending(token)
+    if pending is None:
+        flash("That confirmation link has expired or was already used.", "warn")
+        return redirect(url_for("index" if "user" in g else "login"))
+    return render_template("verify_link.html", email=pending["email"])
+
+
+def _dispatch(fn: Callable[..., object], *args: object) -> None:
+    """Run `fn` off the request thread. Used for the reset email so the page
+    answers in the same time whether or not an account matched (a slow SMTP
+    server would otherwise reveal which usernames exist). Tests replace this
+    with a direct call."""
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def forgot_password():
+    """Ask for a reset link by username or email. The answer is the same whether
+    or not an account matched, and per-IP throttled."""
+    if LOGIN_DISABLED or "user" in g:
+        return redirect(url_for("index"))
+    if not email_configured():
+        flash("Reset by email isn't set up on this server. Ask whoever runs it to "
+              "run `python app.py reset-password`.", "warn")
+        return redirect(url_for("login"))
+    if request.method == "POST":
+        ip = _client_ip()
+        if not current_app.extensions["reset_limiter"].hit(ip):
+            logger.warning("Password-reset requests throttled for %s", ip)
+            abort(429, "Too many reset requests -- try again later.")
+        issued = auth.issue_reset(request.form.get("identifier", ""))
+        if issued is not None:
+            user, token = issued
+            logger.info("Password reset link issued for %r from %s", user["username"], ip)
+            _dispatch(send_password_reset, user["email"], user["username"], token)
+        flash("If that matches an account with an email address, a reset link is on "
+              "its way. It works once and expires in an hour.", "info")
+        return redirect(url_for("login"))
+    return render_template("forgot.html")
+
+
+def reset_with_link(token: str):
+    """The page a reset email links to: pick a new password. Shows the form only
+    for a live link, and uses the link up when the password is set."""
+    if LOGIN_DISABLED or "user" in g:
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        error = auth.finish_reset(token, request.form.get("password", ""),
+                                  request.form.get("confirm", ""))
+        if error is None:
+            flash("Password changed. Sign in with the new one.", "info")
+            return redirect(url_for("login"))
+        flash(error, "warn")
+        if error == auth.RESET_EXPIRED:
+            return redirect(url_for("forgot_password"))
+        return redirect(url_for("reset_with_link", token=token))
+    if not auth.reset_link_valid(token):
+        flash(auth.RESET_EXPIRED, "warn")
+        return redirect(url_for("forgot_password"))
+    return render_template("reset.html", min_password=auth.MIN_PASSWORD_CHARS)
 
 
 def logout():
@@ -490,7 +646,92 @@ def settings():
             flash("A topic is 8-64 letters, numbers, dashes or underscores -- long and "
                   "unguessable, since anyone who knows it can read your alerts.", "warn")
         return redirect(url_for("settings"))
-    return render_template("settings.html", topic=g.user["ntfy_topic"] or "")
+    return render_template("settings.html", topic=g.user["ntfy_topic"] or "",
+                           email=g.user["email"] or "",
+                           email_confirmed=bool(g.user["email_verified_at"]),
+                           pending_email=db.pending_verification_email(g.user["id"]) or "",
+                           can_reset=email_configured(),
+                           min_password=auth.MIN_PASSWORD_CHARS)
+
+
+def change_email():
+    """Move the account to a new email. Needs the current password (otherwise a
+    borrowed session could redirect the reset link), and the new address only
+    replaces the old one once its confirmation link is used."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    _check_password_attempts_allowed()
+    if not email_configured():
+        flash("This server can't send email, so an address can't be confirmed yet.", "warn")
+        return redirect(url_for("settings"))
+    if not current_app.extensions["verify_limiter"].hit(_client_ip()):
+        abort(429, "Too many confirmation emails -- try again later.")
+    address, token, error = auth.change_email(g.user["id"], request.form.get("current", ""),
+                                              request.form.get("email", ""))
+    if error is None:
+        _mail_verification(g.user["id"], address, token)
+        flash(f"We sent a confirmation link to {address}. Your email changes when you "
+              "open it.", "info")
+    else:
+        if error == auth.WRONG_PASSWORD:
+            _note_wrong_password()
+        flash(error, "warn")
+    return redirect(url_for("settings"))
+
+
+def _check_password_attempts_allowed() -> None:
+    """Changing a password or deleting an account asks for the current one, so a
+    stolen session could use those forms to guess it. Wrong guesses share the
+    login's per-IP failure budget."""
+    if current_app.extensions["login_limiter"].blocked(_client_ip()):
+        logger.warning("Password prompt throttled for %s", _client_ip())
+        abort(429, "Too many failed attempts -- try again in a few minutes.")
+
+
+def _note_wrong_password() -> None:
+    current_app.extensions["login_limiter"].hit(_client_ip())
+    logger.warning("Wrong current password for %r from %s", g.user["username"], _client_ip())
+
+
+def change_password():
+    """Set a new password. Asks for the current one; the other devices' sessions
+    end, this one carries on under the new password."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    _check_password_attempts_allowed()
+    error = auth.change_password(g.user["id"], request.form.get("current", ""),
+                                 request.form.get("password", ""),
+                                 request.form.get("confirm", ""))
+    if error is not None:
+        if error == auth.WRONG_PASSWORD:
+            _note_wrong_password()
+        flash(error, "warn")
+        return redirect(url_for("settings"))
+    logger.info("Password changed for %r", g.user["username"])
+    _sign_in(g.user["id"])
+    flash("Password changed. Other devices have been signed out.", "info")
+    return redirect(url_for("settings"))
+
+
+def delete_account():
+    """Remove the signed-in account and its whole list, after the password is
+    given again. Unrecoverable, so the form says so and takes the username too."""
+    if LOGIN_DISABLED:
+        return redirect(url_for("index"))
+    _check_password_attempts_allowed()
+    user = g.user
+    if request.form.get("username", "").strip().lower() != user["username"].lower():
+        flash("Type your username to confirm deleting the account.", "warn")
+        return redirect(url_for("settings"))
+    if auth.authenticate(user["username"], request.form.get("current", "")) is None:
+        _note_wrong_password()
+        flash(auth.WRONG_PASSWORD, "warn")
+        return redirect(url_for("settings"))
+    db.delete_user(user["id"])
+    logger.info("Deleted account %r (id=%s) and its list", user["username"], user["id"])
+    session.clear()
+    flash("Your account and its restaurant list were deleted.", "info")
+    return redirect(url_for("login"))
 
 
 def index():
@@ -932,6 +1173,13 @@ _URLS: list[tuple[str, Callable, tuple[str, ...]]] = [
     ("/signup", signup, ("GET", "POST")),
     ("/logout", logout, ("POST",)),
     ("/settings", settings, ("GET", "POST")),
+    ("/forgot", forgot_password, ("GET", "POST")),
+    ("/reset/<token>", reset_with_link, ("GET", "POST")),
+    ("/verify-email", verify_email, ("GET", "POST")),
+    ("/verify/<token>", verify_link, ("GET", "POST")),
+    ("/settings/email", change_email, ("POST",)),
+    ("/settings/password", change_password, ("POST",)),
+    ("/settings/delete-account", delete_account, ("POST",)),
     ("/", index, ("GET",)),
     ("/restaurant/<int:restaurant_id>", detail, ("GET",)),
     ("/restaurant/<int:restaurant_id>/unarchive", unarchive, ("POST",)),
@@ -957,7 +1205,9 @@ def create_app(config: dict | None = None) -> Flask:
         SESSION_COOKIE_SAMESITE="Lax",
         # Set when it's served over HTTPS (a proxy or tunnel), so the cookie
         # never travels in the clear.
-        SESSION_COOKIE_SECURE=bool(env_int("DASHBOARD_COOKIE_SECURE", 0)),
+        # Always on when the server does TLS itself.
+        SESSION_COOKIE_SECURE=(bool(env_int("DASHBOARD_COOKIE_SECURE", 0))
+                               or auth.tls_files() is not None),
         PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
     )
     hops = max(0, env_int("DASHBOARD_PROXY_HOPS", 0))
@@ -968,6 +1218,10 @@ def create_app(config: dict | None = None) -> Flask:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops)  # type: ignore[method-assign]
     app.extensions["login_limiter"] = auth.RateLimiter(auth.LOGIN_FAILURES,
                                                        auth.LOGIN_WINDOW_SECONDS)
+    app.extensions["verify_limiter"] = auth.RateLimiter(auth.VERIFY_REQUESTS,
+                                                        auth.RESET_WINDOW_SECONDS)
+    app.extensions["reset_limiter"] =auth.RateLimiter(auth.RESET_REQUESTS,
+                                                       auth.RESET_WINDOW_SECONDS)
     app.extensions["signup_limiter"] = auth.RateLimiter(auth.SIGNUP_ATTEMPTS,
                                                         auth.SIGNUP_WINDOW_SECONDS)
     app.extensions["action_limiter"] = auth.RateLimiter(
@@ -999,29 +1253,70 @@ def _create_user_from_terminal() -> None:
     import getpass
     init_db()
     while True:
+        # Typed at the server's own terminal, so the address counts as confirmed.
         _, error = auth.create_account(input("Username: "), getpass.getpass("Password: "),
-                                       getpass.getpass("Again: "))
+                                       getpass.getpass("Again: "), input("Email: "),
+                                       verified=True)
         if error is None:
             print("Account created.")
             return
         print(error)
 
 
+def _reset_password_from_terminal() -> None:
+    """The reset for a forgotten password: whoever can run this on the server can
+    set any account's password. It also ends that account's signed-in sessions."""
+    import getpass
+    init_db()
+    username = input("Username: ")
+    while True:
+        error = auth.reset_password(username, getpass.getpass("New password: "),
+                                    getpass.getpass("Again: "))
+        if error is None:
+            print("Password changed. Every device signed in to that account is signed out.")
+            return
+        print(error)
+        if error == auth.NO_SUCH_USER:
+            return
+
+
 def serve() -> None:
-    """Run under waitress, a production WSGI server (Flask's dev server isn't
-    meant to face a network). Refuses a non-loopback host while sign-up is open."""
+    """Run the dashboard: under waitress, a production WSGI server (Flask's dev
+    server isn't meant to face a network), or under cheroot with HTTPS when
+    DASHBOARD_TLS_CERT / DASHBOARD_TLS_KEY are set (waitress can't do TLS).
+    Refuses a non-loopback host while sign-up is open."""
     host = env_str("DASHBOARD_HOST", DASHBOARD_HOST)
     port = env_int("DASHBOARD_PORT", DASHBOARD_PORT)
     init_db()  # the binding check counts accounts, so the table must exist
     auth.require_safe_binding(host)
-    from waitress import serve as waitress_serve
+    tls = auth.tls_files()
     app = create_app()
-    logger.info("Dashboard on http://%s:%s", host, port)
-    waitress_serve(app, host=host, port=port, threads=4)
+    if tls is None:
+        if not auth.is_loopback(host) and not env_int("DASHBOARD_COOKIE_SECURE", 0):
+            logger.warning("Listening on %s without TLS: passwords and sessions cross the "
+                           "network in the clear. Set DASHBOARD_TLS_CERT/KEY, or put an HTTPS "
+                           "proxy in front and set DASHBOARD_COOKIE_SECURE=1.", host)
+        from waitress import serve as waitress_serve
+        logger.info("Dashboard on http://%s:%s", host, port)
+        waitress_serve(app, host=host, port=port, threads=4)
+        return
+    from cheroot.ssl.builtin import BuiltinSSLAdapter
+    from cheroot.wsgi import Server
+    server = Server((host, port), app, numthreads=4)
+    server.ssl_adapter = BuiltinSSLAdapter(str(tls[0]), str(tls[1]))
+    logger.info("Dashboard on https://%s:%s", host, port)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["create-user"]:
         _create_user_from_terminal()
+    elif sys.argv[1:] == ["reset-password"]:
+        _reset_password_from_terminal()
     else:
         serve()
