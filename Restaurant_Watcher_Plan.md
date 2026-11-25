@@ -83,15 +83,11 @@ Flat layout, one module per role:
 ## 4. Known gaps and risks
 
 - **Auth limits.** TLS is optional (`DASHBOARD_TLS_CERT/KEY` → cheroot, else a proxy/tunnel in front;
-  README, "Reaching it from a phone"). Passwords change, emails set and accounts delete in Settings.
-  Every account needs a confirmed email: sign-up mails a single-use link (24 h) and the account is
-  gated to `/verify-email` until it's used; a new address (Settings, password required) replaces the
-  old only when its link is used. The gate and sign-up both need SMTP, so sign-up is refused without
-  it and the gate is skipped (else everyone is locked out); `create-user` takes an email and counts
-  it confirmed. Forgotten passwords: an emailed single-use link (1 hour) to the confirmed address;
-  tokens are stored hashed and links are built from `DASHBOARD_URL`. Otherwise
-  `python app.py reset-password` on the server. The login and per-IP rate limits are in-process
-  memory, so they reset on restart and assume one dashboard process.
+  README, "Reaching it from a phone"). Sign-up and the email-verification gate both need SMTP, so
+  sign-up is refused without it and the gate is skipped (else everyone is locked out). Without SMTP
+  there is no emailed reset; `python app.py reset-password` on the server is the only route. The login
+  and per-IP rate limits are in-process memory, so they reset on restart and assume one dashboard
+  process.
 - **Provider-side spend caps are manual and unconfirmed.** The in-app limits (section 2) don't stop
   a bug in the app or the scheduler itself. Set the Google Cloud Places quota + billing budget alert
   and the Anthropic monthly limit (README, "Spending limits"), then delete this line. There is
