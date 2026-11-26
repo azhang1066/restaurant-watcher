@@ -3,15 +3,24 @@
 Tracks a personal list of restaurants and notifies you when one closes, or
 when recent news suggests one is about to.
 
-## Why it's not a live Google Maps sync
-
 Google doesn't expose a public API to read a personal "saved places" list
 from Maps -- that data lives behind your Google account, not the Places API.
-So this tool flips the model: you seed the list once (from Google Takeout
-export or just typing names in), and the agent's job becomes checking each
-place's status on a schedule rather than syncing the list itself.
+So this tool flips the model: you seed the list once (from a Google Takeout
+export, by typing names in, or through the dashboard's search box), and its
+job is checking each place's status on a schedule rather than syncing the
+list itself.
+
+**Contents:** [Setup](#setup) · [Seed your list](#seed-your-list) ·
+[Run the checks](#run-the-checks) · [How checking works](#how-checking-works) ·
+[Dashboard](#dashboard) · [Accounts](#accounts) ·
+[Reaching it from a phone](#reaching-it-from-a-phone) ·
+[Costs and spending limits](#costs-and-spending-limits) ·
+[Monitoring](#noticing-a-dead-scheduler) · [Data](#data) ·
+[Development](#development)
 
 ## Setup
+
+Python 3.13 (`.python-version`).
 
 ```bash
 pip install -c requirements-lock.txt -r requirements.txt   # runtime
@@ -19,27 +28,28 @@ pip install -c requirements-lock.txt -r requirements.txt   # runtime
 cp .env.example .env   # fill in your keys
 ```
 
-Python 3.13 (`.python-version`). Dependencies are pinned exactly, and
-`requirements-lock.txt` pins the transitive ones too. `.github/dependabot.yml`
-opens a weekly PR for any bump, and CI (`.github/workflows/tests.yml`) runs
-`ruff check .`, `mypy` and `pytest` on it -- run the same three locally before
-merging anything. The Claude model for the news check
-is a default in `closure_checker.py` that `CLOSURE_CHECK_MODEL` overrides, so
-when a model is retired you can switch it from `.env` without a code change.
-
 You'll need:
-- **Google Places API key** (Places API "New" enabled in Google Cloud Console)
-- **Anthropic API key** (for the closing-soon news check)
-- **ntfy topic** (`NTFY_TOPIC`) -- pick a long, unguessable string, then subscribe
-  to it in the [ntfy app](https://ntfy.sh/) on your phone. Topics are public: anyone
-  who knows the name can read the feed. So **no push is sent** while it's unset or
-  still the placeholder from `.env.example` (an error is logged instead, and email
-  still goes out if you've configured it).
-- **SMTP credentials** (optional) -- set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`,
-  `EMAIL_FROM`, and `EMAIL_TO` in `.env` to also get alerts by email. Leave these
-  unset and only ntfy push notifications will fire. For Gmail, use an
+
+- **Google Places API key** (`GOOGLE_PLACES_API_KEY`, with Places API "New"
+  enabled in Google Cloud Console).
+- **Anthropic API key** (for the closing-soon news check). The Claude model it
+  uses is a default in `closure_checker.py` that `CLOSURE_CHECK_MODEL`
+  overrides, so when a model is retired you can switch it from `.env` without a
+  code change.
+- **ntfy topic** (`NTFY_TOPIC`) -- pick a long, unguessable string, then
+  subscribe to it in the [ntfy app](https://ntfy.sh/) on your phone. Topics are
+  public: anyone who knows the name can read the feed. So **no push is sent**
+  while it's unset or still the placeholder from `.env.example` (an error is
+  logged instead, and email still goes out if you've configured it).
+- **SMTP credentials** (optional for alerts, required for dashboard sign-up) --
+  set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`, and `EMAIL_TO` to
+  also get alerts by email. Leave these unset and only ntfy push notifications
+  will fire. For Gmail, use an
   [app password](https://myaccount.google.com/apppasswords) rather than your
   normal password.
+
+Every other setting mentioned below also lives in `.env`; `.env.example`
+lists them with their defaults.
 
 ## Seed your list
 
@@ -55,12 +65,17 @@ Katz's Delicatessen, Manhattan
 python seed.py restaurants.txt --user yourname
 ```
 
+`--user NAME` picks whose list the restaurants go on; it is optional while
+there is at most one account (see [Accounts](#accounts)).
+
 Seeding resolves each line through Google Places and takes the first hit, with
 nobody looking at any of them -- so seeded restaurants land **unverified** and
 are not checked until you confirm each one on the dashboard. See
-[Verifying a restaurant](#verifying-a-restaurant).
+[Verifying a restaurant](#verifying-a-restaurant). `seed.py` is the way to add a
+list in bulk; for one restaurant at a time, use the dashboard's
+[search box](#adding-a-restaurant).
 
-## Run
+## Run the checks
 
 ```bash
 python main.py --once     # one check, right now
@@ -71,123 +86,122 @@ For a real deployment, run `main.py` as a background service (systemd,
 Replit scheduled deployment, or a cron entry calling `--once`) rather than
 leaving a terminal open.
 
-Only one run happens at a time: a second `--once` while the scheduler is
-mid-run is skipped with a warning, not run alongside it. Restarting the
-scheduler doesn't trigger a check; its first run is a week after the last
-completed one (or immediately, if that was longer ago or there never was one).
-The run counter and the time of the last completed run live in the database.
+- **One run at a time.** A second `--once` while the scheduler is mid-run is
+  skipped with a warning, not run alongside it.
+- **Restarts don't trigger a check.** The scheduler's first run is a week after
+  the last completed one (or immediately, if that was longer ago or there never
+  was one). The run counter and the time of the last completed run live in the
+  database.
+- **Logs** go to stderr and to `data/restaurant-watcher.log` (rotating;
+  `LOG_FILE` moves it, `LOG_FILE=off` disables it).
 
-Logs go to stderr and to `data/restaurant-watcher.log` (rotating; `LOG_FILE`
-moves it, `LOG_FILE=off` disables it).
+## How checking works
 
-### Noticing a dead scheduler
+Each run checks every verified, non-archived restaurant in two steps:
 
-A scheduler that has stopped can't tell you so itself. Two things cover it:
+1. **Business status** (every run, cheap): the Places API `businessStatus`
+   field flags `CLOSED_TEMPORARILY` / `CLOSED_PERMANENTLY` directly.
+2. **Closing soon** (every Nth run, costs more): Claude with web search looks
+   for recent news of an announced closure. It runs less often (default: every
+   4th run, set by `CLOSING_SOON_CHECK_EVERY`) since it's a heavier, fuzzier
+   signal.
 
-- Set `HEALTHCHECK_URL` to a push monitor ([healthchecks.io](https://healthchecks.io),
-  Uptime Kuma, ...). Each completed run pings it (`/fail` if every check failed), and
-  the monitor alerts you when the pings stop. This is the one that catches the
-  scheduler while it is down.
-- When the scheduler starts after 14+ days without a completed run, it sends a
-  high-priority push saying so. That only fires once it's back, so it covers
-  "I restarted it and want to know what I missed", not "it died".
+Both steps are skipped entirely for a restaurant you haven't verified yet; see
+[Verifying a restaurant](#verifying-a-restaurant).
 
-The dashboard also flags anything not checked in 14+ days as **Stale**.
+The dashboard's **Check now** button runs step 1 on a single restaurant, never
+step 2 -- see [Checking a restaurant now](#checking-a-restaurant-now). Both paths
+go through the same `checker.check_one()`, so a manual check writes, alerts and
+archives exactly as a scheduled one does.
+
+### What happens after a check
+
+- **Permanent closures** auto-archive the restaurant after notifying.
+  Temporary closures and closing-soon flags stay active, so you keep getting
+  the context on future runs.
+- **Alerts are never lost or repeated.** A check's result and the alert it owes
+  are recorded together; the alert is then sent and marked delivered. If ntfy
+  and email are both down, the new status is still saved and the alert goes out
+  first thing on the next run (archived rows included), once.
+- **Unreadable news checks** -- a reply that is cut off, not JSON, or otherwise
+  unreadable -- count as a *failed* news check, not as "no closure news": the
+  stored flag is kept and the log says why.
+- **Unknown statuses** -- a `businessStatus` value Google adds in future -- are
+  stored as `BUSINESS_STATUS_UNSPECIFIED` and logged, rather than failing that
+  row forever.
+
+### When checks fail
+
+A run that couldn't check some restaurants sends one push saying how many, and
+names any that Google answers 404 for (a retired place id). Those keep failing
+every run until you delete the row and add the place again from the dashboard.
+
+A run stops early, counting the rest as failed, when Google refuses the API key
+(401/403) or 10 checks in a row fail for any other reason -- there's no point
+grinding through the list one retry at a time when the key or the network is
+down.
 
 ## Dashboard
 
-A page over whatever the checks have recorded:
+A page over whatever the checks have recorded, and where you add, verify and
+manage restaurants:
 
 ```bash
 python app.py           # waitress on http://127.0.0.1:5000
 ```
 
-The index lists every tracked restaurant -- closures and closing-soon
-signals sorted to the top -- with its status, last-checked age, and the
-summary behind any closing-soon flag. It's paged (100 a page) and has a filter
-box matching name or address; the tiles at the top always count everything.
-The "waiting to be verified" card spells out the first 50. Clicking one opens its per-month
-check history (`db.check_history()`, which merges live `check_log` rows with
-the rollups older checks are folded into, so the totals survive pruning).
+Every page needs a login, even on localhost -- see [Accounts](#accounts). The
+dashboard never runs the scheduled checks; those still run from `main.py`.
+
+The index lists every restaurant on your list -- closures and closing-soon
+signals sorted to the top -- with its status, last-checked age, and the summary
+behind any closing-soon flag. It's paged (100 a page) and has a filter box
+matching name or address; the tiles at the top always count everything.
 Archived restaurants stay listed, greyed out, rather than disappearing.
 
-Anything not checked in 14+ days is flagged **Stale** -- a scheduler that
-has quietly died otherwise looks just like a week with no bad news.
+Anything not checked in 14+ days is flagged **Stale** -- a scheduler that has
+quietly died otherwise looks just like a week with no bad news.
 
-### Checking a restaurant now
+Clicking a restaurant opens its per-month check history
+(`db.check_history()`, which merges live `check_log` rows with the rollups
+older checks are folded into, so the totals survive
+[pruning](#history-retention)).
 
-Next to Delete, every row a scheduled run would check carries a **Check now**
-button: it re-polls Google for that one restaurant immediately, writes the
-result, logs it, and sends the same alerts and archives on the same rule the
-weekly run does.
+### Adding a restaurant
 
-It runs the *cheap* half of a check only. A full check also asks Claude
-whether there is closure news about the place, and that call is allowed 120
-seconds before it gives up -- too long to hold a page open, and it spends
-real credits per press. So **Check now** never moves the closing-soon flag;
-whatever the last news check concluded is carried forward untouched, and the
-next news check happens on the weekly schedule as usual. Pressing the button
-does not shift that schedule either: the run counter that decides when the
-next news check falls due is left alone, so checking one restaurant cannot
-delay the news check for the rest.
+The search box at the top of the index takes a name and, optionally, a city or
+street. It resolves the name through Google Places Text Search and shows you
+the single match it found -- name, address and a Maps link -- and nothing is
+tracked until you press **Track this restaurant** on that page.
 
-The button is only offered where a scheduled run would act: not on an
-unverified restaurant (that gate exists so nothing is spent on a row nobody
-has confirmed) and not on an archived one (re-activate it first).
+The confirm step is not ceremony. Text Search always answers with its one best
+guess and no confidence alongside it, so a mistyped or ambiguous name comes
+back as a real restaurant somewhere else, and a wrong one being watched looks
+exactly like a right one. The address is what tells them apart. It's the same
+question [verification](#verifying-a-restaurant) asks of seeded rows -- asked
+before the row is written rather than after -- so restaurants added this way
+are stored already verified.
 
-#### Spending limits
+Each search costs one Text Search call (the same call `seed.py` makes per
+line), so the search is a POST that a link or a prefetch can't trigger, and
+confirming (or reloading the confirm page) costs nothing further. The Flask
+process needs `GOOGLE_PLACES_API_KEY` in its environment for this; without it
+the page says so instead of failing silently.
 
-Both money-spending buttons are capped, so a stuck key or a runaway script can't
-run up a bill. All three settings live in `.env` (see `.env.example`):
-
-- `CHECK_NOW_COOLDOWN_HOURS` (default 24) -- Check now is disabled, and refused if
-  posted anyway, for a restaurant checked less than this long ago. That includes
-  the weekly run's check, since a second look minutes later buys nothing.
-- `DASHBOARD_CHECKS_PER_DAY` (default 50) and `DASHBOARD_SEARCHES_PER_DAY`
-  (default 25) -- rolling 24-hour caps on Check now and on the add-a-restaurant
-  search. Presses are counted before the call is made, so a request that fails
-  after Google bills it still counts. `0` removes a cap.
-
-Every POST form also locks its buttons once submitted (`static/app.js`), so a
-double-click can't send the request twice. That's a convenience, not a guard --
-the limits above are what actually bound spending.
-
-The scheduled run neither draws on these budgets nor is stopped by them: refusing
-a scheduled check would silently stop the watching. Claude is never called from
-the dashboard, so there is no Claude budget here.
-
-**Backstop at the provider** (not enforced by this code -- set these once in the
-consoles, so a bug here can't get around them):
-
-- Google Cloud Console → APIs & Services → Places API (New) → Quotas: lower
-  "requests per day" to a few times your list size, and add a billing budget
-  with an alert (Billing → Budgets & alerts).
-- Anthropic Console → Settings → Limits: set a monthly spend limit.
-
-### Removing a restaurant
-
-Each row in the table ends with a **Delete** button: the restaurant stops
-being checked, and its row and check history are removed. The button opens a
-confirmation page naming the restaurant (server-side, so it works with
-JavaScript off), because nothing here can put it back -- only the log line
-records what went, place_id included.
-
-Deleting is for somewhere you no longer care about. **Archiving** is the
-softer option and the one a permanent closure triggers by itself: the row
-stays in the table, greyed out, skipped by the weekly check, with its history
-intact and a **Re-activate** button if the place turns out to have reopened.
-Archived rows keep their Delete button too -- a closure you've read about is
-often exactly the thing you want off the page.
+Searching for something already tracked takes you to its row rather than
+adding a duplicate -- including when it's archived, which is how you'd
+rediscover that a place reopened.
 
 ### Verifying a restaurant
 
 A name search returns exactly one guess with no confidence beside it, so the
 wrong "Lilia" gets watched just as happily as the right one -- and looks
-identical once it's in the table. A restaurant is therefore **not checked at
-all** until you've confirmed it points at the place you meant.
+identical once it's in the table. A restaurant from `seed.py` is therefore
+**not checked at all** until you've confirmed it points at the place you meant.
 
-Unverified restaurants collect at the top of the index with their name,
-address and a Maps link, and two buttons:
+Unverified restaurants collect at the top of the index in a "waiting to be
+verified" card (which spells out the first 50), each with its name, address and
+a Maps link, and two buttons:
 
 - **Yes, that's the place** -- starts checking it from the next run onward.
   Nothing else about the row changes.
@@ -197,169 +211,230 @@ address and a Maps link, and two buttons:
   history describes a different restaurant. This only works on an unverified
   row; a restaurant you confirmed long ago can't be deleted from a stale tab.
 
-Until then nothing is spent on them -- no Places call, no Claude call -- and
-no alert can fire about them, since an alert about the wrong restaurant is
-exactly what this is here to prevent. Each run sends **one** push saying how
-many are waiting (not one per restaurant, so seeding a long file doesn't empty
-your battery), linking to `DASHBOARD_URL`.
-
-Restaurants added through the dashboard's search box skip all this: the
-confirm page **is** the verification, so they're stored already verified.
+Until then nothing is spent on them -- no Places call, no Claude call -- and no
+alert can fire about them, since an alert about the wrong restaurant is exactly
+what this is here to prevent. Each run sends **one** push saying how many are
+waiting (not one per restaurant, so seeding a long file doesn't empty your
+battery), linking to `DASHBOARD_URL`.
 
 Upgrading an existing database is handled automatically -- anything that had
 already been checked is treated as verified, since you've been reading its
 alerts for months. Only never-checked rows get asked about.
 
-### Adding a restaurant
+### Checking a restaurant now
 
-The search box at the top of the index takes a name and, optionally, a city
-or street. It resolves the name through Google Places Text Search and shows
-you the single match it found -- name, address and a Maps link -- and nothing
-is tracked until you press **Track this restaurant** on that page.
+Next to Delete, every row a scheduled run would check carries a **Check now**
+button: it re-polls Google for that one restaurant immediately, writes the
+result, logs it, and sends the same alerts and archives on the same rule the
+weekly run does.
 
-The confirm step is not ceremony. Text Search always answers with its one
-best guess and no confidence alongside it, so a mistyped or ambiguous name
-comes back as a real restaurant somewhere else, and a wrong one being watched
-looks exactly like a right one. The address is what tells them apart. It's the
-same question [verification](#verifying-a-restaurant) asks of seeded rows --
-asked before the row is written rather than after.
+It runs the *cheap* half of a check only. A full check also asks Claude whether
+there is closure news about the place, and that call is allowed 120 seconds
+before it gives up -- too long to hold a page open, and it spends real credits
+per press. So **Check now** never moves the closing-soon flag; whatever the last
+news check concluded is carried forward untouched. Pressing the button doesn't
+shift the schedule either: the run counter that decides when the next news check
+falls due is left alone, so checking one restaurant cannot delay the news check
+for the rest.
 
-This is also the only button here that spends money -- one Text Search call
-per search, the same call `seed.py` makes per line -- so the search is a POST
-that a link or a prefetch can't trigger, and confirming (or reloading the
-confirm page) costs nothing further. The Flask process needs
-`GOOGLE_PLACES_API_KEY` in its environment for this; without it the page says
-so instead of failing silently.
+The button is only offered where a scheduled run would act: not on an
+unverified restaurant (that gate exists so nothing is spent on a row nobody has
+confirmed) and not on an archived one (re-activate it first). It is also limited
+by a per-restaurant cooldown and a daily budget; see
+[Spending limits](#spending-limits).
 
-Searching for something already tracked takes you to its row rather than
-adding a duplicate -- including when it's archived, which is how you'd
-rediscover that a place reopened.
+### Archiving, re-activating and deleting
 
-`seed.py` is still the way to add a list in bulk (`--user NAME` picks whose list;
-it is optional while there is at most one account).
+**Archiving** is what a permanent closure does by itself: the row stays in the
+table, greyed out, skipped by the weekly check, with its history intact.
 
-### Re-activating an archived restaurant
+**Re-activate** puts an archived row back on the active list -- the right move
+when Google was mistaken or the place came back. Only the archived flag changes;
+the stored status and closing-soon flag are left as they were, so re-activating
+can't re-fire a closure alert that already went out. That does mean a place
+Google still reports as permanently closed gets archived again by the next
+check; the page says so when you click it.
 
-Permanent closures archive themselves, which is right when a place is gone
-and wrong when Google was mistaken or the place came back. Archived rows stay
-listed with a **Re-activate** button that puts them on the active list again.
+**Delete** is for somewhere you no longer care about, and every row has it,
+archived ones included -- a closure you've read about is often exactly the thing
+you want off the page. The restaurant stops being checked, and its row and check
+history are removed. The button opens a confirmation page naming the restaurant
+(server-side, so it works with JavaScript off), because nothing here can put it
+back -- only the log line records what went, place_id included.
 
-Only the archived flag changes -- the stored status and closing-soon flag are
-left as they were, so re-activating can't re-fire a closure alert that already
-went out. That does mean a place Google still reports as permanently closed
-gets archived again by the next check; the page says so when you click it.
+### Request safety
 
-Every POST is CSRF-checked by one hook (a route added later is covered by
-default), against a token tied to the session cookie, so set
-`DASHBOARD_SECRET_KEY` in `.env` to choose the key. Without it a key is
-generated once and kept in `data/.dashboard_secret`, so an open page survives
-a restart (delete the file to rotate it). Pages load no inline script or style, and
-send a Content-Security-Policy saying so.
+- Every POST is CSRF-checked by one hook (so a route added later is covered by
+  default), against a token tied to the session cookie. Set
+  `DASHBOARD_SECRET_KEY` to choose the key; without it a key is generated once
+  and kept in `data/.dashboard_secret`, so an open page survives a restart
+  (delete the file to rotate it).
+- Pages load no inline script or style, and send a Content-Security-Policy
+  saying so.
+- Every POST form locks its buttons once submitted (`static/app.js`), so a
+  double-click can't send the request twice. That's a convenience, not a guard
+  -- the [spending limits](#spending-limits) are what actually bound spending.
 
-### Reaching it from a phone
+## Accounts
 
-Every page needs a login, even on localhost. Accounts are stored on the server
-(the password hashed, in the database), so one account works from your computer,
-your phone and anything else that reaches it. **Create one from the login page's
-"Create an account" link** (username of 3-32 letters, numbers, `.`, `-`, `_`;
-password of 8+ characters), or with `python app.py create-user`.
+Accounts are stored on the server (the password hashed, in the database), so
+one account works from your computer, your phone and anything else that reaches
+it. **Create one from the login page's "Create an account" link** (username of
+3-32 letters, numbers, `.`, `-`, `_`; password of 8+ characters), or with
+`python app.py create-user`.
 
-**Every account has its own list.** A restaurant belongs to the account that added
-it, and nobody sees, checks, verifies or deletes another's -- the same place can be
-on several lists. The list that existed before accounts was adopted by the first
-account created. Closure alerts go to that account's own ntfy topic, set under
-**Settings** (top of every page); an account with no topic of its own uses
-`NTFY_TOPIC` from `.env`, as does email (one `EMAIL_TO` for the whole install).
-The things that spend money are shared: the daily Search / Check-now budgets and
-the Places / Anthropic bills are the install's, not per account, and a place two
-people watch is checked once for each of them.
+### Each account has its own list
+
+A restaurant belongs to the account that added it, and nobody sees, checks,
+verifies or deletes another's -- the same place can be on several lists. The
+list that existed before accounts was adopted by the first account created.
+
+Closure alerts go to that account's own ntfy topic, set under **Settings** (top
+of every page); an account with no topic of its own uses `NTFY_TOPIC` from
+`.env`. Email alerts go to the single `EMAIL_TO` for the whole install.
+
+The things that spend money are shared: the daily Search / Check-now budgets
+and the Places / Anthropic bills are the install's, not per account, and a
+place two people watch is checked once for each of them.
+
+### Email confirmation
+
+**Every account needs a confirmed email.** Sign-up asks for one and emails a
+link; the account is signed in but can't do anything until that link is opened
+and Confirm pressed (the link works once and lasts 24 hours; the page lets you
+resend it or correct the address). A new address only replaces the old one when
+its link is used, whether at sign-up or under **Settings** (which also asks for
+your password).
+
+Because mail must go out for any of this to work, **sign-up is refused while
+SMTP isn't configured** (`SMTP_HOST` and `EMAIL_FROM`, see [Setup](#setup)).
+Without SMTP, create accounts with `python app.py create-user`, which asks for
+an email and counts it as confirmed since you typed it at the server. Accounts
+that predate this are asked to confirm (or add) an email the next time they
+sign in, once SMTP is configured; until then they aren't gated, since nobody
+could confirm.
+
+Set `DASHBOARD_URL` to the address people reach the dashboard at: confirmation
+and password-reset links are built from it (never from the request, which a
+stranger could forge).
+
+### Passwords and sessions
+
+- Under **Settings** you can change your password (the current one is required,
+  and your other devices are signed out), set an email address, or delete your
+  account, which removes its restaurant list and history too.
+- **Forgot your password?** on the sign-in page emails a link to the account's
+  confirmed address; it works once and expires in an hour. The reply is the same
+  whether or not an account matched, and requests are limited to 5 an hour per
+  IP. If you can't get the email, whoever runs the server resets it with
+  `python app.py reset-password`.
+- Signed-in sessions last 30 days; there's a Sign out button.
+
+### Login and rate limits
+
+- Five failed logins from one IP lock that IP out for 15 minutes.
+- Sign-up allows 10 attempts an hour per IP.
+- Search and Check now are limited per IP (`DASHBOARD_ACTIONS_PER_MINUTE`,
+  default 10) in front of the daily budgets.
+
+These counters live in memory and reset on a restart; the daily budgets are in
+the database.
+
+## Reaching it from a phone
 
 Anyone who can create an account can press the buttons that spend money, so
-sign-up is gated before the server is reachable from anywhere else:
+sign-up must be gated before the server is reachable from anywhere else:
 
-- `DASHBOARD_SIGNUP_CODE` -- sign-up asks for this code. **`python app.py` refuses
-  a `DASHBOARD_HOST` beyond loopback unless a code is set** (or sign-up is off).
+- `DASHBOARD_SIGNUP_CODE` -- sign-up asks for this code. **`python app.py`
+  refuses a `DASHBOARD_HOST` beyond loopback unless a code is set** (or sign-up
+  is off).
 - `DASHBOARD_SIGNUP=off` -- hides sign-up entirely, once the accounts you want
-  exist. Beyond loopback it also refuses to start with no account to sign in with.
+  exist. Beyond loopback it also refuses to start with no account to sign in
+  with.
 - With neither, sign-up is open: fine on localhost only.
+
+Then:
 
 1. Create your account on localhost first.
 2. Set `DASHBOARD_SIGNUP_CODE`, `DASHBOARD_HOST` (e.g. `0.0.0.0`) and
    `DASHBOARD_PORT` if needed; share the code only with people you trust.
-3. Serve it over HTTPS; passwords and the session cookie are otherwise sent in the
-   clear (the server logs a warning when it listens beyond loopback without it).
-   Either:
+3. Serve it over HTTPS; passwords and the session cookie are otherwise sent in
+   the clear (the server logs a warning when it listens beyond loopback without
+   it). Either:
    - set `DASHBOARD_TLS_CERT` and `DASHBOARD_TLS_KEY` to PEM files and
-     `python app.py` serves HTTPS itself (via cheroot; waitress can't do TLS), with
-     the cookie marked Secure and an HSTS header; or
-   - put a reverse proxy or tunnel (Tailscale Serve, Cloudflare Tunnel) in front.
-     Set `DASHBOARD_COOKIE_SECURE=1`, and `DASHBOARD_PROXY_HOPS=1` (the number of
-     trusted proxies) so the per-IP limits see the real client address. Leave
-     `DASHBOARD_PROXY_HOPS` at 0 if the port is directly reachable.
+     `python app.py` serves HTTPS itself (via cheroot; waitress can't do TLS),
+     with the cookie marked Secure and an HSTS header; or
+   - put a reverse proxy or tunnel (Tailscale Serve, Cloudflare Tunnel) in
+     front. Set `DASHBOARD_COOKIE_SECURE=1`, and `DASHBOARD_PROXY_HOPS=1` (the
+     number of trusted proxies) so the per-IP limits see the real client
+     address. Leave `DASHBOARD_PROXY_HOPS` at 0 if the port is directly
+     reachable.
 
-**Passwords and accounts.** Under **Settings** you can change your password (the
-current one is required, and your other devices are signed out), set an email
-address, or delete your account, which removes its restaurant list and history too.
-
-**Every account needs a confirmed email.** Sign-up asks for one and emails a link;
-the account is signed in but can't do anything until that link is opened and
-Confirm pressed (the link works once and lasts 24 hours; the page lets you resend
-it or correct the address). A new address only replaces the old one when its link
-is used, whether at sign-up or under **Settings** (which also asks for your
-password). Because mail must go out for any of this to work, **sign-up is refused
-while SMTP isn't configured** (`SMTP_HOST` and `EMAIL_FROM`, see above); create
-accounts with `python app.py create-user`, which asks for an email and counts it as
-confirmed since you typed it at the server. Accounts that predate this are asked to
-confirm (or add) an email the next time they sign in, once SMTP is configured; until
-then they aren't gated, since nobody could confirm.
-
-*Forgotten password:* the sign-in page's **Forgot your password?** emails a link
-to the account's confirmed address; it works once and expires in an hour. Set
-`DASHBOARD_URL` to the address people reach the dashboard at, because both kinds of
-link are built from it (never from the request, which a stranger could forge). The
-reply is the same whether or not an account matched, and requests are limited to 5
-an hour per IP. If you can't get the email, whoever runs the server resets it with
-`python app.py reset-password`.
-
-Signed-in sessions last 30 days; there's a Sign out button. Five failed logins
-from one IP lock that IP out for 15 minutes, and sign-up allows 10 attempts an hour per IP. Search and Check now are also
-limited per IP (`DASHBOARD_ACTIONS_PER_MINUTE`, default 10) in front of the daily
-budgets. These counters live in memory and reset on a restart; the daily budgets
-are in the database. `python app.py` runs waitress; `flask --app app run` is
+`python app.py` runs waitress (or cheroot, with TLS); `flask --app app run` is
 the dev server, for localhost only.
 
-Checks themselves still run from `main.py`.
+## Costs and spending limits
 
-## How checking works
+### Where the money goes
 
-1. **Business status** (every run, cheap): Places API `businessStatus`
-   field -- flags `CLOSED_TEMPORARILY` / `CLOSED_PERMANENTLY` directly.
-2. **Closing soon** (every Nth run, costs more): Claude API with web
-   search looks for recent news of an announced closure. Runs less often
-   (default: every 4th check) since it's a heavier, fuzzier signal.
+- **Places `businessStatus`** stays in the cheap Essentials/Pro tier (~$5/1K
+  calls) as long as you don't add fields like `rating` or `currentOpeningHours`
+  to the field mask -- those bump the whole call to the pricier Enterprise tier.
+- **The Claude + web search step** is the main cost driver;
+  `CLOSING_SOON_CHECK_EVERY` controls how often it runs. Nothing on the
+  dashboard triggers it -- **Check now** is deliberately the Places half only,
+  so no button on the page can run up a Claude bill.
+- **Two dashboard buttons do spend**, both in the cheap tier and both once per
+  press: **Search** (one Text Search) and **Check now** (one `businessStatus`
+  call). Both sit behind the login, a per-IP rate limit and the daily budgets
+  below.
 
-Both steps are skipped entirely for a restaurant you haven't verified yet;
-see [Verifying a restaurant](#verifying-a-restaurant).
+### Spending limits
 
-The dashboard's **Check now** button runs step 1 on a single restaurant,
-never step 2 -- see [Checking a restaurant now](#checking-a-restaurant-now).
-Both paths go through the same `checker.check_one()`, so a manual check writes,
-alerts and archives exactly as a scheduled one does.
+Both money-spending buttons are capped, so a stuck key or a runaway script
+can't run up a bill:
 
-Permanent closures auto-archive the restaurant after notifying; temporary
-closures and closing-soon flags stay active so you keep getting the
-context on future runs.
+- `CHECK_NOW_COOLDOWN_HOURS` (default 24) -- Check now is disabled, and refused
+  if posted anyway, for a restaurant checked less than this long ago. That
+  includes the weekly run's check, since a second look minutes later buys
+  nothing.
+- `DASHBOARD_CHECKS_PER_DAY` (default 50) and `DASHBOARD_SEARCHES_PER_DAY`
+  (default 25) -- rolling 24-hour caps on Check now and on the add-a-restaurant
+  search. Presses are counted before the call is made, so a request that fails
+  after Google bills it still counts. `0` removes a cap.
 
-A check's result and the alert it owes are recorded together; the alert is
-then sent and marked delivered. If ntfy and email are both down, the new status
-is still saved and the alert goes out first thing on the next run (archived
-rows included), once -- it is neither lost nor repeated.
+The scheduled run neither draws on these budgets nor is stopped by them:
+refusing a scheduled check would silently stop the watching.
 
-A news-check reply that is cut off, not JSON, or otherwise unreadable counts as
-a *failed* news check, not as "no closure news": the stored flag is kept and
-the log says why.
+### Backstop at the provider
 
-## History retention
+Not enforced by this code -- set these once in the consoles, so a bug here
+can't get around them:
+
+- Google Cloud Console → APIs & Services → Places API (New) → Quotas: lower
+  "requests per day" to a few times your list size, and add a billing budget
+  with an alert (Billing → Budgets & alerts).
+- Anthropic Console → Settings → Limits: set a monthly spend limit.
+
+## Noticing a dead scheduler
+
+A scheduler that has stopped can't tell you so itself. Three things cover it:
+
+- **`HEALTHCHECK_URL`** -- point it at a push monitor
+  ([healthchecks.io](https://healthchecks.io), Uptime Kuma, ...). Each completed
+  run pings it (`/fail` if every check failed), and the monitor alerts you when
+  the pings stop. This is the one that catches the scheduler while it is down.
+- **Catch-up push** -- when the scheduler starts after 14+ days without a
+  completed run, it sends a high-priority push saying so. That only fires once
+  it's back, so it covers "I restarted it and want to know what I missed", not
+  "it died".
+- **Stale flag** -- the dashboard flags anything not checked in 14+ days.
+
+## Data
+
+The database is `data/restaurants.db`; `data/` is gitignored.
+
+### History retention
 
 Every check appends a row to `check_log`, so after each run rows older than
 `CHECK_LOG_RETAIN_DAYS` (default 90) are folded into per-month counts in
@@ -369,36 +444,17 @@ detail rows regardless of age, so the interesting history never gets summarized
 away. `db.check_history(restaurant_id)` reads the two tables back as one
 per-month view. Set `CHECK_LOG_RETAIN_DAYS=0` to keep everything.
 
-## Backups
+### Backups
 
-The database holds your hand-verified list and `data/` is gitignored, so each
-run ends by copying it to `data/backups/restaurants-<timestamp>.db` and keeping
-the newest `BACKUPS_KEPT` (default 8). Set `BACKUPS_KEPT=0` to turn that off.
-To restore, stop the scheduler and dashboard and copy a backup over
-`data/restaurants.db`.
+The database holds your hand-verified list and isn't in git, so each run ends by
+copying it to `data/backups/restaurants-<timestamp>.db` and keeping the newest
+`BACKUPS_KEPT` (default 8). Set `BACKUPS_KEPT=0` to turn that off. To restore,
+stop the scheduler and dashboard and copy a backup over `data/restaurants.db`.
 
-## When checks fail
+## Development
 
-A run that couldn't check some restaurants sends one push saying how many,
-and names any that Google answers 404 for (a retired place id). Those keep
-failing every run until you delete the row and add the place again from the
-dashboard.
-
-A run stops early, counting the rest as failed, when Google refuses the API key
-(401/403) or 10 checks in a row fail for any other reason -- there's no point
-grinding through the list one retry at a time when the key or the network is
-down. A `businessStatus` value Google adds in future is stored as
-`BUSINESS_STATUS_UNSPECIFIED` and logged, rather than failing that row forever.
-
-## Cost notes
-
-- Places `businessStatus` stays in the cheap Essentials/Pro tier (~$5/1K
-  calls) as long as you don't add fields like `rating` or `currentOpeningHours`
-  to the field mask -- those bump the whole call to the pricier Enterprise tier.
-- The Claude + web search step is the main cost driver; the `CLOSING_SOON_CHECK_EVERY`
-  setting in `.env` controls how often it runs. Nothing on the dashboard triggers
-  it -- **Check now** is deliberately the Places half only, so no button on the
-  page can run up a Claude bill.
-- Two dashboard buttons do spend, both in the cheap tier and both once per
-  press: **Search** (one Text Search) and **Check now** (one `businessStatus`
-  call). Both sit behind the login, a per-IP rate limit and the daily budgets.
+Install the dev requirements (the commented line in [Setup](#setup)).
+Dependencies are pinned exactly, and `requirements-lock.txt` pins the
+transitive ones too. `.github/dependabot.yml` opens a weekly PR for any bump,
+and CI (`.github/workflows/tests.yml`) runs `ruff check .`, `mypy` and `pytest`
+on it -- run the same three locally before merging anything.
