@@ -57,7 +57,8 @@ Flat layout, one module per role:
   `serve()` refuses a non-loopback host unless sign-up takes a code or is off. TLS comes from a proxy or
   from `DASHBOARD_TLS_*`, so the cookie's `Secure` flag (automatic with the latter) and
   `X-Forwarded-For` trust are opt-in. Sessions carry a stamp of the password hash, so a password
-  change or reset signs out every other device.
+  change or reset signs out every other device. Each account has its own email, confirmed by a
+  link before the account can be used; that address is used only for confirmation and reset links.
 - **Alerts follow the list's owner.** ntfy goes to the owner's own topic (Settings), falling back to
   `NTFY_TOPIC`; email is one address for the whole install, and run-level pushes (failures, scheduler
   gap) go to the install's topic. The spend budgets stay global.
@@ -90,7 +91,7 @@ Flat layout, one module per role:
   process.
 - **Provider-side spend caps are manual and unconfirmed.** The in-app limits (section 2) don't stop
   a bug in the app or the scheduler itself. Set the Google Cloud Places quota + billing budget alert
-  and the Anthropic monthly limit (README, "Spending limits"), then delete this line. There is
+  and the Anthropic monthly limit (README, "Backstop at the provider"), then delete this line.
   Per-IP limits only slow button-mashing down; they aren't a spend cap.
 - **Serial checks.** One restaurant at a time, with retry backoff. Fine at the current size;
   the first thing to revisit is `concurrent.futures`, or per-restaurant cadence.
@@ -101,9 +102,11 @@ Flat layout, one module per role:
   what the flag is for), but the flag then reflects the last news check, not the present.
 - **The restaurants-to-verify queue is manual.** Batch verify exists; there is no one-click "all",
   on purpose — ticking is the act of having looked at the address.
-- **Text Search bias is soft.** It sends `includedType: restaurant` and, when `SEARCH_BIAS_LAT/LNG`
-  are set, a location bias circle. Both are preferences, not filters, so wrong matches are fewer
-  but the confirm step still matters.
+- **Text Search bias is soft, and there is only one circle.** It sends `includedType: restaurant` and,
+  when `SEARCH_BIAS_LAT/LNG` are set, a location bias circle. Both are preferences, not filters, so
+  wrong matches are fewer but the confirm step still matters. The list covers several cities, so one
+  bias circle would favor one city and make matches elsewhere worse. Leave it unset unless the list
+  becomes one city; putting the city in the query does the same job.
 
 ## 5. Work plan
 
@@ -114,8 +117,12 @@ Flat layout, one module per role:
 
 ## 6. Next steps
 
-1. Run the scheduler against the real list and watch the first genuine status transition end to end
-   — the serial loop's wall-clock time and cost at real length are still estimates.
-2. Set `HEALTHCHECK_URL` against a real monitor and confirm that stopping the scheduler alerts.
-3. Work down the verify queue in batches, looking at each address before ticking it.
-4. Set `SEARCH_BIAS_LAT/LNG` in `.env` and watch whether wrong matches actually drop.
+1. Set the provider-side caps (section 4) **before** the first full run. The list is now at real
+   length, so the first scheduled run is the biggest single spend the app makes: one Places status
+   call per row, plus a Claude news check on the rows that are due for one.
+2. Run the scheduler against the real list. So far only Check-now has touched it; no scheduled run
+   has happened. Record how long the serial loop takes and what it costs; that measurement decides
+   whether Phase 1 is needed. Then watch the first genuine status transition end to end.
+3. Set `HEALTHCHECK_URL` against a real monitor and confirm that stopping the scheduler alerts.
+4. Deal with the seed leftovers in `not_added.txt` (names that didn't resolve to a place): retry
+   each from the add form with a more specific query, or drop it.
