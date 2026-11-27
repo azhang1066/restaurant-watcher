@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 restaurants.txt
 not_added.txt
+not_added.xlsx
+~$not_added.xlsx
